@@ -15,6 +15,6 @@ npm run build      # dist/
 npm run e2e        # headless Chromium against the built dist/ (npx playwright install chromium-headless-shell once)
 ```
 
-## Deploy (Cloudflare Pages)
+## Deploy (Cloudflare Workers)
 
-Build command `npm run build`, output directory `dist`. The Ladybug WASM worker (`assets/lbug_wasm_worker-*.js`, ~24 MB) is under Pages' 25 MiB per-file limit. Monaco loads from jsDelivr at runtime.
+Build command `npm run build`, deploy command `npx wrangler deploy` (serves `dist/` as static assets per `wrangler.jsonc`). The Ladybug WASM worker (`assets/lbug_wasm_worker-*.js`, ~24 MB) is under Cloudflare's 25 MiB per-asset limit. Monaco loads from jsDelivr at runtime.
