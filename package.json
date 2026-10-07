@@ -10,7 +10,7 @@
         "e2e": "node e2e.mjs"
     },
     "dependencies": {
-        "@js-recon/taintwire": "file:../../../../../private/tmp/claude-501/-Users-shriyanss-GItHub-js-recon-workspace/336f4b81-b7e4-495a-9b49-da60ba877b2d/scratchpad/js-recon-taintwire-0.1.0.tgz",
+        "@js-recon/taintwire": "^0.1.1",
         "@ladybugdb/wasm-core": "0.21.2",
         "@monaco-editor/loader": "1.7.0",
         "cytoscape": "3.34.3"
