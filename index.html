@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>taintwire explorer</title>
+        <link rel="stylesheet" href="/src/style.css" />
+    </head>
+    <body>
+        <nav>
+            <strong>taintwire explorer</strong>
+            <button id="generate" title="Ctrl/Cmd+Enter in the JS editor" disabled>Generate</button>
+            <label>parser
+                <select id="parser">
+                    <option value="cs-mast">cs-mast</option>
+                    <option value="babel">babel</option>
+                </select>
+            </label>
+            <span class="sep"></span>
+            <button id="run" title="Ctrl/Cmd+Enter in the Cypher editor" disabled>Run query</button>
+            <select id="examples"><option value="">Example queries…</option></select>
+            <button id="fit" disabled>Fit graph</button>
+            <span id="status">Loading…</span>
+        </nav>
+        <main>
+            <section id="code" data-title="JavaScript"></section>
+            <section id="cypher" data-title="Cypher · Ctrl/Cmd+Enter"></section>
+            <section id="graph-pane">
+                <div id="graph"></div>
+                <div id="legend"></div>
+                <div id="results" hidden></div>
+            </section>
+        </main>
+        <script type="module" src="/src/main.ts"></script>
+    </body>
+</html>
