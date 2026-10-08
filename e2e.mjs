@@ -1,7 +1,17 @@
 // Headless end-to-end check against the production build: `npm run build && npm run e2e`.
 import { spawn } from "node:child_process";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { chromium } from "playwright";
+import * as taintwire from "@js-recon/taintwire";
+
+// A DB file written by the Node build, for the Open DB check.
+const tmp = mkdtempSync(join(tmpdir(), "tw-e2e-"));
+const FIXTURE = join(tmp, "fixture.lbdb");
+const FIXTURE_CODE = "function wrap(v) {\n    return [v];\n}\nconst x = wrap(document.cookie);\nfetch(x);\n";
+await (await taintwire.import(FIXTURE_CODE, { dbPath: FIXTURE, filename: "fixture.js" })).close();
 
 const PORT = 4179;
 const server = spawn(process.execPath, ["node_modules/vite/bin/vite.js", "preview", "--port", String(PORT), "--strictPort"], { stdio: "pipe" });
@@ -56,6 +66,18 @@ try {
     await page.click("#run");
     await page.waitForSelector("#status.error");
 
+    // Open DB: a file written by the Node build renders and is queryable, with its source in the JS editor.
+    await page.setInputFiles("#open-db", FIXTURE);
+    await page.waitForFunction(() => /^fixture\.lbdb: \d+ nodes, \d+ edges|error/.test(document.querySelector("#status").textContent + document.querySelector("#status").className), null, { timeout: 60_000 });
+    const opened = await page.textContent("#status");
+    assert.match(opened, /^fixture\.lbdb: \d+ nodes/);
+    assert.ok(Number(opened.match(/(\d+) nodes/)[1]) > 15, opened);
+    assert.equal(await page.evaluate(() => window.monaco.editor.getEditors()[0].getValue()), FIXTURE_CODE);
+    await setEditor(1, "MATCH (c:CallExpression)-[:CALLS]->(f:FunctionDeclaration) RETURN c, f");
+    await page.click("#run");
+    await page.waitForFunction(() => /rows?,/.test(document.querySelector("#status").textContent), null, { timeout: 30_000 });
+    assert.match(await page.textContent("#status"), /^1 row, 2 nodes highlighted/);
+
     await page.screenshot({ path: "e2e-screenshot.png" });
     const unexpected = errors.filter((e) => !/Nope/.test(e)); // the bad query is logged on purpose
     assert.deepEqual(unexpected, [], "console errors");
@@ -67,4 +89,5 @@ try {
 } finally {
     await browser.close();
     server.kill();
+    rmSync(tmp, { recursive: true, force: true });
 }

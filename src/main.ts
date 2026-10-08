@@ -2,10 +2,19 @@ import "./shim";
 import loader from "@monaco-editor/loader";
 import cytoscape from "cytoscape";
 import * as taintwire from "@js-recon/taintwire/browser";
+import lbug from "@ladybugdb/wasm-core"; // CJS: FS lives on the default export
 // Not in wasm-core's `exports`, so it's imported by path; Vite emits it as an asset and hands back its URL.
 import workerUrl from "../node_modules/@ladybugdb/wasm-core/lbug_wasm_worker.js?url";
 
-taintwire.setWorkerPath(workerUrl);
+// ponytail: wasm-core 0.21.2's worker calls FS.writeFile, but its WASMFS build only exposes createDataFile on FS.
+// Wrap the worker so FS gains writeFile when it's assigned; drop this once upstream exposes it.
+const fsShim = `let fs;
+Object.defineProperty(self, "FS", { configurable: true, get: () => fs, set(v) {
+    if (v && !v.writeFile) v.writeFile = (path, data) => v.createDataFile(path, "", new Uint8Array(data), true, true, true);
+    fs = v;
+} });
+importScripts(${JSON.stringify(new URL(workerUrl, location.href).href)});`;
+taintwire.setWorkerPath(URL.createObjectURL(new Blob([fsShim], { type: "text/javascript" })));
 
 const SAMPLE = `function sanitize(s) {
     return s.replace(/</g, "&lt;");
@@ -109,12 +118,14 @@ const cypherEditor = monaco.editor.create($("cypher"), {
 
 let graph: taintwire.TaintGraph | undefined;
 let busy = false;
+let editorFile: string | undefined; // the file whose source is in the JS editor; undefined = the editor's own code
+let uploads = 0;
 
 /** Run `fn` with the buttons locked; errors go to the status line. */
 async function guarded(label: string, fn: () => Promise<string>) {
     if (busy) return;
     busy = true;
-    for (const b of ["generate", "run", "fit"]) $<HTMLButtonElement>(b).disabled = true;
+    for (const b of ["generate", "open-db", "run", "fit"]) $<HTMLButtonElement>(b).disabled = true;
     status(label);
     const t = performance.now();
     try {
@@ -124,7 +135,7 @@ async function guarded(label: string, fn: () => Promise<string>) {
         console.error(e);
     } finally {
         busy = false;
-        $<HTMLButtonElement>("generate").disabled = false;
+        $<HTMLButtonElement>("generate").disabled = $<HTMLInputElement>("open-db").disabled = false;
         $<HTMLButtonElement>("run").disabled = $<HTMLButtonElement>("fit").disabled = !graph;
     }
 }
@@ -134,18 +145,42 @@ const nodeLabel = (r: Record<string, unknown>) => {
     return extra == null ? String(r.type) : `${r.type} ${String(extra).slice(0, 24)}`;
 };
 
-async function generate() {
+async function reset() {
     await graph?.close();
     graph = undefined;
     cy.elements().remove();
     $("results").hidden = true;
+}
+
+async function generate() {
+    await reset();
     const parser = $<HTMLSelectElement>("parser").value as taintwire.Parser;
     graph = await taintwire.import(jsEditor.getValue(), { parser });
+    editorFile = undefined;
+    return render();
+}
+
+/** Load a LadybugDB file written by taintwire (save() or import with dbPath) and show it. */
+async function openDb(file: File) {
+    await reset();
+    // A fresh path per load, so a previous upload's DB/WAL never collides with this one.
+    const path = `/upload-${++uploads}.lbdb`;
+    await lbug.FS.writeFile(path, await file.arrayBuffer());
+    graph = await taintwire.TaintGraph.open(path);
+    const sources = await graph.query("MATCH (s:Source) RETURN s.file AS file, s.code AS code ORDER BY file");
+    editorFile = sources[0]?.file as string | undefined;
+    if (sources.length) jsEditor.setValue(sources[0].code as string);
+    const shown = sources.length > 1 ? `, ${sources.length} files, showing ${editorFile}` : "";
+    return `${file.name}: ${await render()}${shown}`;
+}
+
+async function render() {
+    if (!graph) throw new Error("No graph");
     // Untyped MATCH spans every node table; columns a table lacks (Scope has no name/offsets) come back null.
     const nodes = await graph.query(
         `MATCH (n) WHERE label(n) <> 'Source'
          RETURN n.id AS id, label(n) AS type, n.name AS name, n.value AS value, n.operator AS op, n.kind AS kind,
-                n.startOffset AS s, n.endOffset AS e`
+                n.file AS file, n.startOffset AS s, n.endOffset AS e`
     );
     const edges = await graph.query("MATCH (a)-[r]->(b) RETURN a.id AS s, b.id AS t, label(r) AS rel");
     cy.add([
@@ -206,8 +241,8 @@ async function runQuery() {
 
 // Clicking a node selects its source in the JS editor; clicking the background clears highlights.
 cy.on("tap", "node", (e) => {
-    const { s, e: end } = e.target.data();
-    if (s == null) return;
+    const { s, e: end, file } = e.target.data();
+    if (s == null || (editorFile !== undefined && file !== editorFile)) return;
     const model = jsEditor.getModel()!;
     const a = model.getPositionAt(s);
     const b = model.getPositionAt(end);
@@ -228,6 +263,12 @@ const doGenerate = () => guarded("Generating…", generate);
 const doRun = () => guarded("Running…", runQuery);
 $("generate").addEventListener("click", doGenerate);
 $("run").addEventListener("click", doRun);
+$<HTMLInputElement>("open-db").addEventListener("change", (e) => {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = ""; // re-selecting the same file still fires change
+    if (file) guarded("Opening…", () => openDb(file));
+});
 $("fit").addEventListener("click", () => cy.fit(undefined, 20));
 jsEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, doGenerate);
 cypherEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, doRun);

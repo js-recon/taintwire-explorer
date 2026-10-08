@@ -13,9 +13,9 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); f
 body { display: grid; grid-template-rows: auto 1fr; }
 nav { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
 nav .sep { width: 1px; height: 20px; background: var(--border); }
-button, select { background: var(--accent); color: #fff; border: 0; border-radius: 3px; padding: 4px 10px; font: inherit; cursor: pointer; }
+button, select, label.button { background: var(--accent); color: #fff; border: 0; border-radius: 3px; padding: 4px 10px; font: inherit; cursor: pointer; }
 select { background: #3c3c3c; }
-button:disabled { opacity: 0.5; cursor: default; }
+button:disabled, label.button:has(:disabled) { opacity: 0.5; cursor: default; }
 #status { margin-left: auto; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45vw; }
 #status.error { color: var(--error); }
 main { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 3fr 1fr; min-height: 0; }
