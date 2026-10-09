@@ -78,6 +78,27 @@ try {
     await page.waitForFunction(() => /rows?,/.test(document.querySelector("#status").textContent), null, { timeout: 30_000 });
     assert.match(await page.textContent("#status"), /^1 row, 2 nodes highlighted/);
 
+    // A graph over the node budget opens collapsed; double-click expands, and a query pulls a collapsed hit into view.
+    const BIG = Array.from({ length: 400 }, (_, i) => `function f${i}(a) {\n    return g${i}(a + ${i});\n}\n`).join("") + "function needle(x) {\n    return x;\n}\n";
+    await setEditor(0, BIG);
+    await page.click("#generate");
+    await page.waitForFunction(() => /of \d+ nodes|error/.test(document.querySelector("#status").textContent + document.querySelector("#status").className), null, { timeout: 60_000 });
+    const shownCount = async () => Number((await page.textContent("#status")).match(/^(\d+) nodes/)[1]);
+    const collapsed = await shownCount();
+    assert.ok(collapsed <= 1500, await page.textContent("#status"));
+    const box = await page.locator("#graph").boundingBox();
+    await page.evaluate(() => cy.zoom({ level: 2, renderedPosition: cy.nodes("[more > 0]").last().renderedPosition() }));
+    const at = await page.evaluate(() => cy.nodes("[more > 0]").last().renderedPosition());
+    await page.mouse.dblclick(box.x + at.x, box.y + at.y);
+    await page.waitForFunction((n) => Number(document.querySelector("#status").textContent.match(/^(\d+) nodes/)?.[1]) > n, collapsed, { timeout: 30_000 });
+    const expanded = await shownCount();
+    await setEditor(1, "MATCH (:FunctionDeclaration)-[:SON]->(i:Identifier {name: 'needle'}) RETURN i");
+    await page.click("#run");
+    await page.waitForFunction(() => /rows?,|error/.test(document.querySelector("#status").textContent + document.querySelector("#status").className), null, { timeout: 30_000 });
+    assert.match(await page.textContent("#status"), /^1 row, 1 node highlighted/);
+    assert.ok(await page.evaluate(() => cy.nodes(".hit").length) === 1);
+    assert.ok(await page.evaluate(() => cy.nodes().length) > expanded);
+
     await page.screenshot({ path: "e2e-screenshot.png" });
     const unexpected = errors.filter((e) => !/Nope/.test(e)); // the bad query is logged on purpose
     assert.deepEqual(unexpected, [], "console errors");

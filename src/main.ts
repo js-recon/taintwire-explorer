@@ -50,6 +50,8 @@ RETURN nodes(p) AS path, length(p) AS hops`,
 const PALETTE = ["#5a5a5a", "#c586c0", "#4ec9b0", "#3d8f80", "#2f5f57", "#569cd6", "#9cdcfe", "#ce9178", "#f44747", "#dcdcaa", "#d7ba7d", "#b5cea8"];
 const REL_COLOR = Object.fromEntries(taintwire.RELATIONS.map((r, i) => [r, PALETTE[i % PALETTE.length]]));
 const HIDDEN_BY_DEFAULT = new Set(["IN_SCOPE"]); // one edge per identifier; drowns the rest
+// Bigger graphs open as the top of the AST; the rest is fetched on double-click or when a query hits it.
+const BUDGET = 1500;
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const status = (msg: string, error = false) => {
@@ -61,6 +63,9 @@ const status = (msg: string, error = false) => {
 const cy = cytoscape({
     container: $("graph"),
     wheelSensitivity: 0.3,
+    webgl: true,
+    hideEdgesOnViewport: true,
+    textureOnViewport: true,
     style: [
         {
             selector: "node",
@@ -70,6 +75,7 @@ const cy = cytoscape({
                 color: "#d4d4d4",
                 "text-valign": "bottom",
                 "text-margin-y": 2,
+                "min-zoomed-font-size": 8,
                 "background-color": "#0e639c",
                 width: 12,
                 height: 12,
@@ -78,6 +84,7 @@ const cy = cytoscape({
         { selector: "node[kind = 'Scope']", style: { shape: "round-rectangle", "background-color": "#4ec9b0" } },
         { selector: "node[kind = 'Identifier']", style: { "background-color": "#9cdcfe" } },
         { selector: "node[kind = 'CallExpression']", style: { "background-color": "#dcdcaa" } },
+        { selector: "node[more > 0]", style: { "border-width": 2, "border-style": "dashed", "border-color": "#d4d4d4" } },
         {
             selector: "edge",
             style: {
@@ -95,6 +102,8 @@ const cy = cytoscape({
         { selector: "node:selected", style: { "border-width": 3, "border-color": "#ffcc00" } },
     ],
 });
+
+Object.assign(window, { cy }); // for e2e and console poking
 
 // Legend doubles as the relation filter.
 for (const rel of taintwire.RELATIONS) {
@@ -174,28 +183,80 @@ async function openDb(file: File) {
     return `${file.name}: ${await render()}${shown}`;
 }
 
-async function render() {
-    if (!graph) throw new Error("No graph");
-    // Untyped MATCH spans every node table; columns a table lacks (Scope has no name/offsets) come back null.
-    const nodes = await graph.query(
-        `MATCH (n) WHERE label(n) <> 'Source'
-         RETURN n.id AS id, label(n) AS type, n.name AS name, n.value AS value, n.operator AS op, n.kind AS kind,
-                n.file AS file, n.startOffset AS s, n.endOffset AS e`
-    );
-    const edges = await graph.query("MATCH (a)-[r]->(b) RETURN a.id AS s, b.id AS t, label(r) AS rel");
-    cy.add([
-        ...nodes.map((n) => ({ data: { ...n, id: n.id as string, kind: n.type, label: nodeLabel(n) } })),
-        ...edges.map((e, i) => ({
-            data: { id: `e${i}`, source: e.s as string, target: e.t as string, rel: e.rel, color: REL_COLOR[e.rel as string] },
-        })),
-    ]);
-    for (const input of $("legend").querySelectorAll("input")) input.dispatchEvent(new Event("change"));
+const NODE_COLS = `n.id AS id, label(n) AS type, n.name AS name, n.value AS value, n.operator AS op, n.kind AS kind,
+                   n.file AS file, n.startOffset AS s, n.endOffset AS e`;
+let total = 0;
+let edgeSeq = 0;
+
+const ids = (rows: Record<string, unknown>[]) => rows.map((r) => r.id as string);
+const sonChildren = async (of: string[]) =>
+    ids(await graph!.query("MATCH (p)-[:SON]->(n) WHERE p.id IN $of RETURN n.id AS id", { of }));
+
+/** Add these nodes (ids that aren't nodes are ignored), every edge between them and what's on screen, and re-lay out. */
+async function show(want: string[], fit = true) {
+    const fresh = [...new Set(want)].filter((id) => cy.getElementById(id).empty());
+    if (fresh.length) {
+        // Untyped MATCH spans every node table; columns a table lacks (Scope has no name/offsets) come back null.
+        const nodes = await graph!.query(`MATCH (n) WHERE n.id IN $fresh RETURN ${NODE_COLS}`, { fresh });
+        const kids = await graph!.query("MATCH (n)-[:SON]->() WHERE n.id IN $fresh RETURN n.id AS id, count(*) AS k", { fresh });
+        const kidCount = new Map(kids.map((r) => [r.id as string, Number(r.k)]));
+        cy.add(nodes.map((n) => ({ data: { ...n, id: n.id as string, kind: n.type, base: nodeLabel(n), kids: kidCount.get(n.id as string) ?? 0 } })));
+        // Edges touching a new node whose other end is on screen; the rest wait until both ends are shown.
+        const edges = [
+            ...(await graph!.query("MATCH (a)-[r]->(b) WHERE a.id IN $fresh RETURN a.id AS s, b.id AS t, label(r) AS rel", { fresh })),
+            ...(await graph!.query("MATCH (a)-[r]->(b) WHERE b.id IN $fresh AND NOT a.id IN $fresh RETURN a.id AS s, b.id AS t, label(r) AS rel", { fresh })),
+        ].filter((e) => cy.getElementById(e.s as string).nonempty() && cy.getElementById(e.t as string).nonempty());
+        cy.add(edges.map((e) => ({ data: { id: `e${edgeSeq++}`, source: e.s as string, target: e.t as string, rel: e.rel, color: REL_COLOR[e.rel as string] } })));
+        for (const input of $("legend").querySelectorAll("input")) input.dispatchEvent(new Event("change"));
+    }
+    // Hidden AST children show as a "+N" on their parent.
+    cy.nodes().forEach((n) => {
+        const more = n.data("kids") - n.outgoers('edge[rel = "SON"]').length;
+        n.data({ more, label: more > 0 ? `${n.data("base")} +${more}` : n.data("base") });
+    });
     // Lay out the AST (SON) as a tree; overlay edges ride along on top of it.
     cy.elements('node, edge[rel = "SON"]')
-        .layout({ name: "breadthfirst", directed: true, roots: cy.nodes('[kind = "File"]') as unknown as string[], spacingFactor: 1.1 })
+        .layout({ name: "breadthfirst", directed: true, roots: cy.nodes('[kind = "File"]') as unknown as string[], spacingFactor: 1.1, fit })
         .run();
-    cy.fit(undefined, 20);
-    return `${nodes.length} nodes, ${edges.length} edges`;
+    if (fit) cy.fit(undefined, 20);
+}
+
+const shown = () =>
+    `${cy.nodes().length} nodes, ${cy.edges().length} edges` +
+    (cy.nodes().length < total ? ` (of ${total} nodes; double-click a +N node to expand)` : "");
+
+async function render() {
+    if (!graph) throw new Error("No graph");
+    const [{ n }] = await graph.query("MATCH (n) WHERE label(n) <> 'Source' RETURN count(*) AS n");
+    total = Number(n);
+    let want: string[];
+    if (total <= BUDGET) want = ids(await graph.query("MATCH (n) WHERE label(n) <> 'Source' RETURN n.id AS id"));
+    else {
+        // Breadth-first down the AST until the next level would blow the budget.
+        want = [];
+        let level = ids(await graph.query("MATCH (n:File) RETURN n.id AS id"));
+        while (level.length && want.length + level.length <= BUDGET) {
+            want.push(...level);
+            level = await sonChildren(level);
+        }
+    }
+    await show(want);
+    return shown();
+}
+
+/** Pull query hits that aren't on screen into view, with their AST ancestors so they hang off the tree. */
+async function reveal(hitIds: string[]) {
+    // ponytail: capped so a query returning every node can't undo the budget; page through hits if that bites.
+    let missing = hitIds.filter((id) => cy.getElementById(id).empty()).slice(0, BUDGET);
+    if (!missing.length) return;
+    const want = [...missing];
+    // One SON hop up per query until we reach what's already shown (AST depth, not graph size, bounds this).
+    while (missing.length) {
+        const parents = ids(await graph!.query("MATCH (n)-[:SON]->(c) WHERE c.id IN $missing RETURN DISTINCT n.id AS id", { missing }));
+        missing = parents.filter((id) => cy.getElementById(id).empty() && !want.includes(id));
+        want.push(...missing);
+    }
+    await show(want, false);
 }
 
 /** Every string anywhere in a result value; node values carry their `id`, so this finds the nodes a row mentions. */
@@ -227,9 +288,11 @@ async function runQuery() {
     $("results").replaceChildren(table);
     $("results").hidden = false;
 
+    const hitIds = [...new Set(rows.flatMap(strings))];
+    if (cy.nodes().length < total) await reveal(hitIds);
     cy.elements().removeClass("hit dim");
     const hits = cy.collection();
-    for (const id of new Set(rows.flatMap(strings))) hits.merge(cy.getElementById(id));
+    for (const id of hitIds) hits.merge(cy.getElementById(id));
     if (hits.nonempty()) {
         cy.elements().addClass("dim");
         hits.removeClass("dim").addClass("hit");
@@ -251,6 +314,13 @@ cy.on("tap", "node", (e) => {
     jsEditor.revealRangeInCenter(range);
 });
 cy.on("tap", (e) => e.target === cy && cy.elements().removeClass("hit dim"));
+cy.on("dbltap", "node[more > 0]", (e) =>
+    guarded("Expanding…", async () => {
+        await show(await sonChildren([e.target.id()]), false);
+        cy.animate({ center: { eles: e.target }, duration: 300 });
+        return shown();
+    })
+);
 
 for (const name of Object.keys(EXAMPLES)) $("examples").append(new Option(name, name));
 $<HTMLSelectElement>("examples").addEventListener("change", (e) => {
