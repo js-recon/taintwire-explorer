@@ -1,6 +1,8 @@
 import "./shim";
 import loader from "@monaco-editor/loader";
 import cytoscape from "cytoscape";
+// @ts-expect-error no bundled types
+import fcose from "cytoscape-fcose";
 import * as taintwire from "@js-recon/taintwire/browser";
 import lbug from "@ladybugdb/wasm-core"; // CJS: FS lives on the default export
 // Not in wasm-core's `exports`, so it's imported by path; Vite emits it as an asset and hands back its URL.
@@ -60,6 +62,7 @@ const status = (msg: string, error = false) => {
     $("status").classList.toggle("error", error);
 };
 
+cytoscape.use(fcose);
 const cy = cytoscape({
     container: $("graph"),
     wheelSensitivity: 0.3,
@@ -214,11 +217,79 @@ async function show(want: string[], fit = true) {
         const more = n.data("kids") - n.outgoers('edge[rel = "SON"]').length;
         n.data({ more, label: more > 0 ? `${n.data("base")} +${more}` : n.data("base") });
     });
-    // Lay out the AST (SON) as a tree; overlay edges ride along on top of it.
-    cy.elements('node, edge[rel = "SON"]')
-        .layout({ name: "breadthfirst", directed: true, roots: cy.nodes('[kind = "File"]') as unknown as string[], spacingFactor: 1.1, fit })
-        .run();
-    if (fit) cy.fit(undefined, 20);
+    if (fit) {
+        // Force layout over every edge (AST and overlays): connected nodes pull together, all nodes push apart.
+        spread(true);
+        cy.fit(undefined, 20);
+    } else if (fresh.length) {
+        // Expand/reveal: drop new nodes next to their AST parent and spread only them; everything else stays pinned.
+        const added = cy.collection();
+        for (const id of fresh) added.merge(cy.getElementById(id));
+        placeOrder(added).nodes().forEach((n) => {
+            const parent = n.incomers('edge[rel = "SON"]').sources();
+            const at = parent.nonempty() ? parent.first().position() : { x: 0, y: 0 };
+            n.position({ x: at.x + (Math.random() - 0.5) * 40, y: at.y + 30 + Math.random() * 20 });
+        });
+        spread(false, cy.nodes().not(added));
+    }
+}
+
+/** Parents before children, so a new node's AST parent already has a position when it's placed. */
+function placeOrder(added: cytoscape.NodeCollection) {
+    const out = cy.collection();
+    let level = added.filter((n) => n.incomers('edge[rel = "SON"]').sources().intersection(added).empty());
+    while (level.nonempty()) {
+        out.merge(level);
+        level = level.outgoers('edge[rel = "SON"]').targets().intersection(added);
+    }
+    return out;
+}
+
+/** fcose over everything on screen, then clear leftover overlaps; `pinned` nodes don't move. */
+function spread(randomize: boolean, pinned = cy.collection()) {
+    pinned.lock();
+    cy.layout({
+        name: "fcose",
+        randomize,
+        animate: false,
+        fit: false,
+        nodeDimensionsIncludeLabels: true,
+        nodeRepulsion: 20000,
+        idealEdgeLength: 80,
+        fixedNodeConstraint: pinned.nodes().map((n) => ({ nodeId: n.id(), position: { ...n.position() } })),
+    } as cytoscape.LayoutOptions).run();
+    separate();
+    pinned.unlock();
+}
+
+/** Forces can still leave a few node bodies overlapping; push each such pair apart along its shallower axis. */
+function separate(gap = 4) {
+    // ponytail: x-sorted sweep, under 0.1 s total at the 1500-node budget; bodies only (labels still may overlap), use a grid index if the budget grows.
+    for (let round = 0; round < 50; round++) {
+        const boxes = cy.nodes().map((n) => ({ n, b: n.boundingBox({ includeLabels: false }) }));
+        boxes.sort((p, q) => p.b.x1 - q.b.x1);
+        let moved = false;
+        for (let i = 0; i < boxes.length; i++) {
+            const a = boxes[i];
+            for (let j = i + 1; j < boxes.length && boxes[j].b.x1 < a.b.x2 + gap; j++) {
+                const b = boxes[j];
+                const ox = Math.min(a.b.x2, b.b.x2) - Math.max(a.b.x1, b.b.x1) + gap;
+                const oy = Math.min(a.b.y2, b.b.y2) - Math.max(a.b.y1, b.b.y1) + gap;
+                if (ox <= 0 || oy <= 0) continue;
+                const free = [a, b].filter((x) => !x.n.locked());
+                if (!free.length) continue;
+                // Away from each other on the shallower axis, split between whichever ends may move.
+                const [dx, dy] = ox < oy ? [ox * Math.sign(b.b.x1 + b.b.x2 - a.b.x1 - a.b.x2 || 1), 0] : [0, oy * Math.sign(b.b.y1 + b.b.y2 - a.b.y1 - a.b.y2 || 1)];
+                for (const x of free) {
+                    const s = (x === a ? -1 : 1) / free.length;
+                    x.n.shift({ x: dx * s, y: dy * s });
+                    x.b = { ...x.b, x1: x.b.x1 + dx * s, x2: x.b.x2 + dx * s, y1: x.b.y1 + dy * s, y2: x.b.y2 + dy * s };
+                }
+                moved = true;
+            }
+        }
+        if (!moved) return;
+    }
 }
 
 const shown = () =>

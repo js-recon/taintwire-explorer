@@ -51,6 +51,16 @@ try {
     const nodes = Number(status.match(/(\d+) nodes/)[1]);
     assert.ok(nodes > 15, `expected a graph, got: ${status}`);
     assert.equal(await page.locator("#graph canvas").count() > 0, true);
+    // Force layout: no two nodes sit on top of each other.
+    const stacked = () =>
+        page.evaluate(() => {
+            const bs = cy.nodes().map((n) => n.boundingBox({ includeLabels: false }));
+            let k = 0;
+            for (let i = 0; i < bs.length; i++)
+                for (let j = i + 1; j < bs.length; j++) if (bs[i].x1 < bs[j].x2 && bs[j].x1 < bs[i].x2 && bs[i].y1 < bs[j].y2 && bs[j].y1 < bs[i].y2) k++;
+            return k;
+        });
+    assert.equal(await stacked(), 0, "stacked nodes");
 
     // Query: the one call that resolves is id(a).
     await setEditor(1, "MATCH (c:CallExpression)-[:CALLS]->(f:FunctionDeclaration) RETURN c.id AS call, f.id AS fn");
@@ -87,11 +97,16 @@ try {
     const collapsed = await shownCount();
     assert.ok(collapsed <= 1500, await page.textContent("#status"));
     const box = await page.locator("#graph").boundingBox();
-    await page.evaluate(() => cy.zoom({ level: 2, renderedPosition: cy.nodes("[more > 0]").last().renderedPosition() }));
+    await page.evaluate(() => { cy.zoom(2); cy.center(cy.nodes("[more > 0]").last()); }); // clear of the overlaid panels
+    assert.equal(await stacked(), 0, "stacked nodes (collapsed)");
+    const before = await page.evaluate(() => Object.fromEntries(cy.nodes().map((n) => [n.id(), n.position()])));
     const at = await page.evaluate(() => cy.nodes("[more > 0]").last().renderedPosition());
     await page.mouse.dblclick(box.x + at.x, box.y + at.y);
     await page.waitForFunction((n) => Number(document.querySelector("#status").textContent.match(/^(\d+) nodes/)?.[1]) > n, collapsed, { timeout: 30_000 });
     const expanded = await shownCount();
+    // Expanding moves only the new subtree.
+    const moved = await page.evaluate((b) => Object.entries(b).filter(([id, p]) => { const q = cy.getElementById(id).position(); return q.x !== p.x || q.y !== p.y; }).length, before);
+    assert.equal(moved, 0, "pinned nodes moved on expand");
     await setEditor(1, "MATCH (:FunctionDeclaration)-[:SON]->(i:Identifier {name: 'needle'}) RETURN i");
     await page.click("#run");
     await page.waitForFunction(() => /rows?,|error/.test(document.querySelector("#status").textContent + document.querySelector("#status").className), null, { timeout: 30_000 });
