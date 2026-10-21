@@ -70,6 +70,21 @@ try {
         }, [text, len]);
         await page.waitForFunction((b) => cy.nodes(".cursor").length === 1 && cy.nodes(".cursor").data("base") === b, base, { timeout: 30_000 });
     };
+    // Dragging the divider resizes both sides, and cytoscape follows its container; it clamps at the edges.
+    const drag = async (x) => {
+        const d = await page.locator("#divider").boundingBox();
+        await page.mouse.move(d.x + d.width / 2, d.y + d.height / 2);
+        await page.mouse.down();
+        await page.mouse.move(x, d.y + d.height / 2, { steps: 5 });
+        await page.mouse.up();
+        await page.waitForFunction(() => Math.abs(cy.width() - document.querySelector("#graph").clientWidth) < 1);
+        return [(await page.locator("#code").boundingBox()).width, (await page.locator("#graph").boundingBox()).width];
+    };
+    const [code1, graph1] = await drag(400);
+    assert.ok(Math.abs(code1 - 400) < 3 && graph1 > 900, `drag left: ${code1}/${graph1}`);
+    const [code2] = await drag(5);
+    assert.ok(Math.abs(code2 - 150) < 3, `clamp: ${code2}`);
+    await drag(700); // back to roughly even for the rest of the run
     await cursorOn("id(a)", "CallExpression");
     await cursorOn("sourc", "Identifier source");
 

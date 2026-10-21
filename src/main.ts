@@ -109,6 +109,19 @@ const cy = cytoscape({
 
 Object.assign(window, { cy }); // for e2e and console poking
 
+// Cytoscape only watches the window, so tell it when the pane itself changes size (divider drag, media query).
+new ResizeObserver(() => cy.resize()).observe($("graph"));
+
+// Drag the divider to split editors vs graph; pointer capture keeps the drag alive over the Monaco/canvas panes.
+const divider = $("divider");
+divider.addEventListener("pointerdown", (e) => divider.setPointerCapture(e.pointerId));
+divider.addEventListener("pointermove", (e) => {
+    if (!divider.hasPointerCapture(e.pointerId)) return;
+    const box = divider.parentElement!.getBoundingClientRect();
+    const left = Math.min(Math.max(e.clientX - box.left, 150), box.width - 150);
+    divider.parentElement!.style.setProperty("--left", `${left}px`);
+});
+
 // Legend doubles as the relation filter.
 for (const rel of taintwire.RELATIONS) {
     const row = document.createElement("label");
