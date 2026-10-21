@@ -5,6 +5,7 @@ Paste JavaScript, build its [taintwire](https://taintwire.js-recon.io) graph in 
 - **Generate** (Ctrl/Cmd+Enter in the JS editor) parses the code and loads the AST plus the semantic overlays (scopes, references, value flow, calls) into an in-memory graph.
 - **Run query** (Ctrl/Cmd+Enter in the Cypher editor) shows the rows under the graph and highlights every node a row mentions. **Example queries** has starters.
 - Click a node to select its source. Toggle relations in the legend.
+- **Multi file** (navbar session dropdown) swaps the editor for a file explorer. **Open js-recon.db…** loads the JS files [js-recon](https://github.com/js-recon/js-recon) downloaded (its `raw_files` table, js-recon 2.1.0-alpha.1 or newer), and Generate builds one graph from the checked files. Clicking a node opens the file it came from. A taintwire DB holding several files also opens as a multi-file session.
 
 ## Develop
 

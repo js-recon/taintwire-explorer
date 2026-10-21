@@ -10,6 +10,10 @@
     <body>
         <nav>
             <strong>taintwire explorer</strong>
+            <select id="session" title="Single file: code typed in the editor. Multi file: the JS files from a js-recon.db">
+                <option value="single">Single file</option>
+                <option value="multi">Multi file</option>
+            </select>
             <button id="generate" title="Ctrl/Cmd+Enter in the JS editor" disabled>Generate</button>
             <label>parser
                 <select id="parser">
@@ -18,6 +22,7 @@
                 </select>
             </label>
             <label class="button" title="Open a taintwire LadybugDB file">Open DB…<input type="file" id="open-db" hidden /></label>
+            <label class="button" id="open-jsr-label" title="Load the JS files from a js-recon.db (js-recon 2.1.0-alpha.1 or newer)" hidden>Open js-recon.db…<input type="file" id="open-jsr" accept=".db" hidden /></label>
             <span class="sep"></span>
             <button id="run" title="Ctrl/Cmd+Enter in the Cypher editor" disabled>Run query</button>
             <select id="examples"><option value="">Example queries…</option></select>
@@ -25,7 +30,10 @@
             <span id="status">Loading…</span>
         </nav>
         <main>
-            <section id="code" data-title="JavaScript"></section>
+            <section id="code" data-title="JavaScript">
+                <div id="files" hidden></div>
+                <div id="editor"></div>
+            </section>
             <section id="cypher" data-title="Cypher · Ctrl/Cmd+Enter"></section>
             <div id="divider"></div>
             <section id="graph-pane">

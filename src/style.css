@@ -22,6 +22,14 @@ main { display: grid; grid-template-columns: var(--left, 1fr) 5px 1fr; grid-temp
 #code { grid-column: 1; grid-row: 1; border-bottom: 1px solid var(--border); }
 #cypher { grid-column: 1; grid-row: 2; }
 #code, #cypher { min-height: 0; overflow: hidden; position: relative; }
+#code { display: flex; }
+#editor { flex: 1; min-width: 0; }
+#files { width: 220px; flex: none; overflow: auto; padding: 4px 0; background: var(--panel); border-right: 1px solid var(--border); font: 12px ui-monospace, monospace; white-space: nowrap; }
+#files details > :not(summary) { margin-left: 12px; }
+#files summary, #files .file { padding: 1px 6px; cursor: pointer; }
+#files summary:hover, #files .file:hover { background: #2a2d2e; }
+#files .file.open { background: #04395e; }
+#files input { margin: 0 4px 0 0; vertical-align: middle; }
 #code::after, #cypher::after { content: attr(data-title); position: absolute; top: 4px; right: 18px; z-index: 5; color: var(--muted); font-size: 11px; pointer-events: none; }
 #divider { grid-column: 2; grid-row: 1 / 3; cursor: col-resize; background: var(--border); touch-action: none; }
 #divider:hover, #divider:active { background: var(--accent); }

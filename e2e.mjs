@@ -1,17 +1,35 @@
 // Headless end-to-end check against the production build: `npm run build && npm run e2e`.
 import { spawn } from "node:child_process";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium } from "playwright";
 import * as taintwire from "@js-recon/taintwire";
+import initSqlJs from "sql.js";
 
 // A DB file written by the Node build, for the Open DB check.
 const tmp = mkdtempSync(join(tmpdir(), "tw-e2e-"));
 const FIXTURE = join(tmp, "fixture.lbdb");
 const FIXTURE_CODE = "function wrap(v) {\n    return [v];\n}\nconst x = wrap(document.cookie);\nfetch(x);\n";
 await (await taintwire.import(FIXTURE_CODE, { dbPath: FIXTURE, filename: "fixture.js" })).close();
+
+// A js-recon.db with a raw_files table (as js-recon run writes it), for the multi-file session check.
+const RAW = {
+    "output/app/main.js": "const q = location.hash.slice(1);\nshow(q);\n",
+    "output/app/lib/sink.js": "function show(v) {\n    eval(v);\n}\n",
+};
+const JSR_FIXTURE = join(tmp, "js-recon.db");
+const jsr = new (await initSqlJs()).Database();
+jsr.run("CREATE TABLE raw_files (path TEXT PRIMARY KEY, url TEXT, content TEXT)");
+for (const [path, code] of Object.entries(RAW)) jsr.run("INSERT INTO raw_files VALUES (?, ?, ?)", [path, `http://app.test/${path}`, code]);
+writeFileSync(JSR_FIXTURE, jsr.export());
+jsr.close();
+// A taintwire DB holding two files opens as a multi-file session.
+const MULTI_FIXTURE = join(tmp, "multi.lbdb");
+const multiGraph = await taintwire.TaintGraph.open(MULTI_FIXTURE);
+for (const [path, code] of Object.entries(RAW)) await multiGraph.add(code, path);
+await multiGraph.close();
 
 const PORT = 4179;
 const server = spawn(process.execPath, ["node_modules/vite/bin/vite.js", "preview", "--port", String(PORT), "--strictPort"], { stdio: "pipe" });
@@ -144,6 +162,46 @@ try {
     const hidden = await page.evaluate(() => cy.nodes().length);
     await cursorOn("x;\n}\n", "Identifier x", 1);
     assert.ok(await page.evaluate(() => cy.nodes().length) > hidden);
+
+    // Multi-file session: js-recon.db's raw_files become a file tree, and Generate parses only the checked files.
+    const statusIs = (re) =>
+        page.waitForFunction((src) => new RegExp(src).test(document.querySelector("#status").textContent) || document.querySelector("#status").classList.contains("error"), re.source, { timeout: 60_000 })
+            .then(async () => assert.match(await page.textContent("#status"), re));
+    const graphFiles = () => page.evaluate(() => [...new Set(cy.nodes().map((n) => n.data("file")).filter(Boolean))].sort());
+    const editorText = () => page.evaluate(() => window.monaco.editor.getEditors()[0].getValue());
+    await page.selectOption("#session", "multi");
+    await statusIs(/^Open a js-recon\.db/);
+    await page.setInputFiles("#open-jsr", JSR_FIXTURE);
+    await statusIs(/^js-recon\.db: 2 files/);
+    const paths = Object.keys(RAW).sort();
+    assert.deepEqual(await page.$$eval("#files .file", (fs) => fs.map((f) => f.dataset.path)), paths);
+    assert.equal(await editorText(), RAW[paths[0]]); // output/app/lib/sink.js
+    await page.click("#files summary:has-text('lib') input"); // unchecks lib/ and the file under it
+    await page.click("#generate");
+    await statusIs(/nodes, \d+ edges, 1 file/);
+    assert.deepEqual(await graphFiles(), ["output/app/main.js"]);
+    await page.click("#files summary:has-text('lib') input");
+    await page.click("#generate");
+    await statusIs(/nodes, \d+ edges, 2 files/);
+    assert.deepEqual(await graphFiles(), paths);
+    // Tapping a node from another file opens that file and selects the node's code; the cursor then maps back to the graph.
+    await page.evaluate(() => cy.nodes('[file = "output/app/main.js"][kind = "CallExpression"]').first().emit("tap"));
+    assert.equal(await editorText(), RAW["output/app/main.js"]);
+    assert.equal(await page.getAttribute("#files .file.open", "data-path"), "output/app/main.js");
+    await page.click("#files .file[data-path='output/app/lib/sink.js']");
+    assert.equal(await editorText(), RAW["output/app/lib/sink.js"]);
+    await cursorOn("eval(v)", "CallExpression");
+    assert.equal(await page.evaluate(() => cy.nodes(".cursor").data("file")), "output/app/lib/sink.js");
+    // A taintwire DB with several files opens as a multi-file session, and switching back to single file hides the tree.
+    await page.selectOption("#session", "single");
+    await statusIs(/^Ready/);
+    await page.setInputFiles("#open-db", MULTI_FIXTURE);
+    await statusIs(/^multi\.lbdb: \d+ nodes, \d+ edges, 2 files/);
+    assert.equal(await page.inputValue("#session"), "multi");
+    assert.deepEqual(await page.$$eval("#files .file", (fs) => fs.map((f) => f.dataset.path)), paths);
+    await page.selectOption("#session", "single");
+    await statusIs(/^Ready/);
+    assert.equal(await page.isHidden("#files"), true);
 
     await page.screenshot({ path: "e2e-screenshot.png" });
     const unexpected = errors.filter((e) => !/Nope/.test(e)); // the bad query is logged on purpose

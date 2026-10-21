@@ -7,6 +7,7 @@ import * as taintwire from "@js-recon/taintwire/browser";
 import lbug from "@ladybugdb/wasm-core"; // CJS: FS lives on the default export
 // Not in wasm-core's `exports`, so it's imported by path; Vite emits it as an asset and hands back its URL.
 import workerUrl from "../node_modules/@ladybugdb/wasm-core/lbug_wasm_worker.js?url";
+import sqlWasmUrl from "sql.js/dist/sql-wasm-browser.wasm?url";
 
 // ponytail: wasm-core 0.21.2's worker calls FS.writeFile, but its WASMFS build only exposes createDataFile on FS.
 // Wrap the worker so FS gains writeFile when it's assigned; drop this once upstream exposes it.
@@ -134,7 +135,10 @@ for (const rel of taintwire.RELATIONS) {
 
 const monaco = await loader.init();
 const editorOpts = { theme: "vs-dark", automaticLayout: true, minimap: { enabled: false }, fontSize: 13, scrollBeyondLastLine: false };
-const jsEditor = monaco.editor.create($("code"), { ...editorOpts, value: SAMPLE, language: "javascript" });
+// Created by hand: a model Monaco makes from `value` is disposed as soon as setModel swaps it out for a multi-file one.
+const singleModel = monaco.editor.createModel(SAMPLE, "javascript");
+type Model = typeof singleModel;
+const jsEditor = monaco.editor.create($("editor"), { ...editorOpts, model: singleModel });
 const cypherEditor = monaco.editor.create($("cypher"), {
     ...editorOpts,
     value: EXAMPLES["Paths from location.* into html"],
@@ -146,13 +150,15 @@ let graph: taintwire.TaintGraph | undefined;
 let busy = false;
 let editorFile: string | undefined; // the file whose source is in the JS editor; undefined = the editor's own code
 let uploads = 0;
-let graphVersion = -1; // the JS editor's version the graph was built from; offsets are stale once it changes
+const built = new Map<Model, number>(); // each model's version the graph was built from; offsets are stale once it changes
+const files = new Map<string, Model>(); // multi-file session: path -> its editor model
+const multi = () => $<HTMLSelectElement>("session").value === "multi";
 
 /** Run `fn` with the buttons locked; errors go to the status line. */
 async function guarded(label: string, fn: () => Promise<string>) {
     if (busy) return;
     busy = true;
-    for (const b of ["generate", "open-db", "run", "fit"]) $<HTMLButtonElement>(b).disabled = true;
+    for (const b of ["session", "generate", "open-db", "open-jsr", "run", "fit"]) $<HTMLButtonElement>(b).disabled = true;
     status(label);
     const t = performance.now();
     try {
@@ -162,7 +168,7 @@ async function guarded(label: string, fn: () => Promise<string>) {
         console.error(e);
     } finally {
         busy = false;
-        $<HTMLButtonElement>("generate").disabled = $<HTMLInputElement>("open-db").disabled = false;
+        for (const b of ["session", "generate", "open-db", "open-jsr"]) $<HTMLButtonElement>(b).disabled = false;
         $<HTMLButtonElement>("run").disabled = $<HTMLButtonElement>("fit").disabled = !graph;
     }
 }
@@ -175,17 +181,106 @@ const nodeLabel = (r: Record<string, unknown>) => {
 async function reset() {
     await graph?.close();
     graph = undefined;
+    built.clear();
     cy.elements().remove();
     $("results").hidden = true;
 }
 
+const markBuilt = (model: Model) => built.set(model, model.getAlternativeVersionId());
+
 async function generate() {
     await reset();
     const parser = $<HTMLSelectElement>("parser").value as taintwire.Parser;
-    graph = await taintwire.import(jsEditor.getValue(), { parser });
+    if (!multi()) {
+        graph = await taintwire.import(jsEditor.getValue(), { parser });
+        editorFile = undefined;
+        markBuilt(singleModel);
+        return render();
+    }
+    const paths = [...$("files").querySelectorAll<HTMLElement>(".file:has(> input:checked)")].map((f) => f.dataset.path!);
+    if (!paths.length) throw new Error("No files checked; open a js-recon.db and check the files to analyze");
+    graph = await taintwire.TaintGraph.open(undefined, { parser });
+    for (const [i, path] of paths.entries()) {
+        status(`Parsing ${i + 1}/${paths.length}: ${path}`);
+        await graph.add(files.get(path)!.getValue(), path);
+        markBuilt(files.get(path)!);
+    }
+    return `${await render()}, ${paths.length} file${paths.length === 1 ? "" : "s"}`;
+}
+
+/** Show one file of the multi-file session in the JS editor. */
+function openFile(path: string) {
+    jsEditor.setModel(files.get(path)!);
+    editorFile = path;
+    cy.$(".cursor").removeClass("cursor"); // it marked a spot in the file being closed
+    for (const f of $("files").querySelectorAll<HTMLElement>(".file")) f.classList.toggle("open", f.dataset.path === path);
+}
+
+/** Replace the multi-file session's files with these (sorted by path) and build the explorer tree from their paths. */
+function setFiles(rows: { path: string; code: string; url?: string }[]) {
+    jsEditor.setModel(singleModel); // before the old models are disposed under it
+    for (const m of files.values()) m.dispose();
+    files.clear();
+    const root = $("files");
+    root.replaceChildren();
+    const dirs = new Map<string, HTMLElement>();
+    // Paths and URLs come from the uploaded file, so they only ever go in as text.
+    for (const { path, code, url } of rows) {
+        files.set(path, monaco.editor.createModel(code, "javascript"));
+        const parts = path.split("/");
+        let parent = root;
+        for (let i = 1; i < parts.length; i++) {
+            const dir = parts.slice(0, i).join("/");
+            if (!dirs.has(dir)) {
+                const d = document.createElement("details");
+                d.open = true;
+                d.innerHTML = `<summary><input type="checkbox" checked></summary>`;
+                d.firstElementChild!.append(parts[i - 1]);
+                parent.append(d);
+                dirs.set(dir, d);
+            }
+            parent = dirs.get(dir)!;
+        }
+        const leaf = document.createElement("div");
+        leaf.className = "file";
+        leaf.dataset.path = path;
+        leaf.title = url ?? path;
+        leaf.innerHTML = `<input type="checkbox" checked>`;
+        leaf.append(parts.at(-1)!);
+        parent.append(leaf);
+    }
+    if (rows.length) openFile(rows[0].path);
+}
+
+/** Switch the editor pane between the single-file editor and the multi-file explorer. */
+function setSession(mode: string) {
+    $<HTMLSelectElement>("session").value = mode;
+    $("files").hidden = $("open-jsr-label").hidden = mode !== "multi";
     editorFile = undefined;
-    graphVersion = jsEditor.getModel()!.getAlternativeVersionId();
-    return render();
+    if (mode !== "multi") jsEditor.setModel(singleModel);
+    else if (files.size) openFile(files.keys().next().value!);
+}
+
+/** Load the JS files js-recon downloaded (its js-recon.db `raw_files` table) into the multi-file session. */
+async function openJsReconDb(file: File) {
+    await reset();
+    const { default: initSqlJs } = await import("sql.js");
+    const SQL = await initSqlJs({ locateFile: () => sqlWasmUrl });
+    const db = new SQL.Database(new Uint8Array(await file.arrayBuffer()));
+    let rows: { path: string; code: string; url: string }[];
+    try {
+        const cols = db.exec("SELECT name FROM pragma_table_info('raw_files')")[0]?.values.flat() ?? [];
+        if (!cols.length) throw new Error(`${file.name} has no raw_files table; regenerate it with js-recon 2.1.0-alpha.1 or newer`);
+        // A batch run's global DB holds every target's files, keyed by (domain, path).
+        const path = cols.includes("domain") ? "domain || '/' || path" : "path";
+        const [res] = db.exec(`SELECT ${path} AS path, content, url FROM raw_files ORDER BY 1`);
+        rows = (res?.values ?? []).map(([path, code, url]) => ({ path: String(path), code: String(code), url: String(url) }));
+    } finally {
+        db.close();
+    }
+    if (!rows.length) throw new Error(`${file.name} has no files in raw_files`);
+    setFiles(rows);
+    return `${file.name}: ${rows.length} files; uncheck what to skip and hit Generate`;
 }
 
 /** Load a LadybugDB file written by taintwire (save() or import with dbPath) and show it. */
@@ -196,11 +291,20 @@ async function openDb(file: File) {
     await lbug.FS.writeFile(path, await file.arrayBuffer());
     graph = await taintwire.TaintGraph.open(path);
     const sources = await graph.query("MATCH (s:Source) RETURN s.file AS file, s.code AS code ORDER BY file");
+    // Several files open as a multi-file session, so every node can jump to its own file.
+    if (sources.length > 1) {
+        setFiles(sources.map((s) => ({ path: s.file as string, code: s.code as string })));
+        setSession("multi");
+        files.forEach(markBuilt);
+        return `${file.name}: ${await render()}, ${sources.length} files`;
+    }
+    setSession("single");
     editorFile = sources[0]?.file as string | undefined;
-    if (sources.length) jsEditor.setValue(sources[0].code as string);
-    graphVersion = sources.length ? jsEditor.getModel()!.getAlternativeVersionId() : -1;
-    const shown = sources.length > 1 ? `, ${sources.length} files, showing ${editorFile}` : "";
-    return `${file.name}: ${await render()}${shown}`;
+    if (sources.length) {
+        jsEditor.setValue(sources[0].code as string);
+        markBuilt(singleModel);
+    }
+    return `${file.name}: ${await render()}`;
 }
 
 const NODE_COLS = `n.id AS id, label(n) AS type, n.name AS name, n.value AS value, n.operator AS op, n.kind AS kind,
@@ -393,7 +497,11 @@ async function runQuery() {
 // Clicking a node selects its source in the JS editor; clicking the background clears highlights.
 cy.on("tap", "node", (e) => {
     const { s, e: end, file } = e.target.data();
-    if (s == null || (editorFile !== undefined && file !== editorFile)) return;
+    if (s == null) return;
+    if (editorFile !== undefined && file !== editorFile) {
+        if (!multi() || !files.has(file)) return;
+        openFile(file);
+    }
     const model = jsEditor.getModel()!;
     const a = model.getPositionAt(s);
     const b = model.getPositionAt(end);
@@ -405,7 +513,7 @@ cy.on("tap", "node", (e) => {
 let cursorSeq = 0;
 jsEditor.onDidChangeCursorSelection(async ({ selection }: { selection: InstanceType<typeof monaco.Selection> }) => {
     const model = jsEditor.getModel()!;
-    if (!graph || busy || model.getAlternativeVersionId() !== graphVersion) return;
+    if (!graph || busy || model.getAlternativeVersionId() !== built.get(model)) return;
     const seq = ++cursorSeq;
     const s = model.getOffsetAt(selection.getStartPosition());
     const e = model.getOffsetAt(selection.getEndPosition());
@@ -451,6 +559,30 @@ $<HTMLInputElement>("open-db").addEventListener("change", (e) => {
     const file = input.files?.[0];
     input.value = ""; // re-selecting the same file still fires change
     if (file) guarded("Opening…", () => openDb(file));
+});
+$<HTMLInputElement>("open-jsr").addEventListener("change", (e) => {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = "";
+    if (file) guarded("Opening…", () => openJsReconDb(file));
+});
+$<HTMLSelectElement>("session").addEventListener("change", (e) => {
+    const mode = (e.target as HTMLSelectElement).value;
+    guarded("Switching…", async () => {
+        await reset();
+        setSession(mode);
+        if (mode !== "multi") return "Ready — edit the code and hit Generate";
+        return files.size ? `${files.size} files; uncheck what to skip and hit Generate` : "Open a js-recon.db to load its JS files";
+    });
+});
+// A folder's checkbox sets every checkbox under it; clicking a file's name opens it.
+$("files").addEventListener("change", (e) => {
+    const box = e.target as HTMLInputElement;
+    if (box.parentElement!.tagName === "SUMMARY") for (const b of box.closest("details")!.querySelectorAll("input")) b.checked = box.checked;
+});
+$("files").addEventListener("click", (e) => {
+    const el = e.target as HTMLElement;
+    if (el.classList.contains("file")) openFile(el.dataset.path!);
 });
 $("fit").addEventListener("click", () => cy.fit(undefined, 20));
 jsEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, doGenerate);
