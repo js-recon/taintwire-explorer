@@ -103,6 +103,7 @@ const cy = cytoscape({
         { selector: ".hit", style: { "background-color": "#f44747", width: 18, height: 18, "z-index": 10 } },
         { selector: ".dim", style: { opacity: 0.25 } },
         { selector: "node:selected", style: { "border-width": 3, "border-color": "#ffcc00" } },
+        { selector: ".cursor", style: { "border-width": 4, "border-color": "#ffcc00", width: 18, height: 18, "z-index": 11, opacity: 1 } },
     ],
 });
 
@@ -132,6 +133,7 @@ let graph: taintwire.TaintGraph | undefined;
 let busy = false;
 let editorFile: string | undefined; // the file whose source is in the JS editor; undefined = the editor's own code
 let uploads = 0;
+let graphVersion = -1; // the JS editor's version the graph was built from; offsets are stale once it changes
 
 /** Run `fn` with the buttons locked; errors go to the status line. */
 async function guarded(label: string, fn: () => Promise<string>) {
@@ -169,6 +171,7 @@ async function generate() {
     const parser = $<HTMLSelectElement>("parser").value as taintwire.Parser;
     graph = await taintwire.import(jsEditor.getValue(), { parser });
     editorFile = undefined;
+    graphVersion = jsEditor.getModel()!.getAlternativeVersionId();
     return render();
 }
 
@@ -182,6 +185,7 @@ async function openDb(file: File) {
     const sources = await graph.query("MATCH (s:Source) RETURN s.file AS file, s.code AS code ORDER BY file");
     editorFile = sources[0]?.file as string | undefined;
     if (sources.length) jsEditor.setValue(sources[0].code as string);
+    graphVersion = sources.length ? jsEditor.getModel()!.getAlternativeVersionId() : -1;
     const shown = sources.length > 1 ? `, ${sources.length} files, showing ${editorFile}` : "";
     return `${file.name}: ${await render()}${shown}`;
 }
@@ -383,6 +387,31 @@ cy.on("tap", "node", (e) => {
     const range = new monaco.Range(a.lineNumber, a.column, b.lineNumber, b.column);
     jsEditor.setSelection(range);
     jsEditor.revealRangeInCenter(range);
+});
+// Moving the cursor in the JS editor marks the deepest node whose source range contains the selection.
+let cursorSeq = 0;
+jsEditor.onDidChangeCursorSelection(async ({ selection }: { selection: InstanceType<typeof monaco.Selection> }) => {
+    const model = jsEditor.getModel()!;
+    if (!graph || busy || model.getAlternativeVersionId() !== graphVersion) return;
+    const seq = ++cursorSeq;
+    const s = model.getOffsetAt(selection.getStartPosition());
+    const e = model.getOffsetAt(selection.getEndPosition());
+    // Smallest span wins; on a tie (File/Program, a statement and its expression) skip nodes with a same-range AST child.
+    const [hit] = await graph.query(
+        `MATCH (n) WHERE n.startOffset <= $s AND n.endOffset >= $e ${editorFile === undefined ? "" : "AND n.file = $file"}
+         AND NOT EXISTS { MATCH (n)-[:SON]->(c) WHERE c.startOffset = n.startOffset AND c.endOffset = n.endOffset }
+         RETURN n.id AS id ORDER BY n.endOffset - n.startOffset LIMIT 1`,
+        { s, e, ...(editorFile === undefined ? {} : { file: editorFile }) }
+    );
+    if (seq !== cursorSeq) return; // a newer cursor move already ran
+    cy.$(".cursor").removeClass("cursor");
+    if (!hit) return;
+    if (cy.nodes().length < total) await reveal([hit.id as string]);
+    if (seq !== cursorSeq) return;
+    const node = cy.getElementById(hit.id as string).addClass("cursor");
+    const { x1, x2, y1, y2 } = cy.extent();
+    const { x, y } = node.position();
+    if (x < x1 || x > x2 || y < y1 || y > y2) cy.animate({ center: { eles: node }, duration: 300 });
 });
 cy.on("tap", (e) => e.target === cy && cy.elements().removeClass("hit dim"));
 cy.on("dbltap", "node[more > 0]", (e) =>

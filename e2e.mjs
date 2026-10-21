@@ -61,6 +61,17 @@ try {
             return k;
         });
     assert.equal(await stacked(), 0, "stacked nodes");
+    // Selecting code in the JS editor marks the deepest node spanning it.
+    const cursorOn = async (text, base, len = text.length) => {
+        await page.evaluate(([t, len]) => {
+            const ed = window.monaco.editor.getEditors()[0], m = ed.getModel(), i = m.getValue().indexOf(t);
+            const a = m.getPositionAt(i), b = m.getPositionAt(i + len);
+            ed.setSelection(new window.monaco.Selection(a.lineNumber, a.column, b.lineNumber, b.column));
+        }, [text, len]);
+        await page.waitForFunction((b) => cy.nodes(".cursor").length === 1 && cy.nodes(".cursor").data("base") === b, base, { timeout: 30_000 });
+    };
+    await cursorOn("id(a)", "CallExpression");
+    await cursorOn("sourc", "Identifier source");
 
     // Query: the one call that resolves is id(a).
     await setEditor(1, "MATCH (c:CallExpression)-[:CALLS]->(f:FunctionDeclaration) RETURN c.id AS call, f.id AS fn");
@@ -87,6 +98,7 @@ try {
     await page.click("#run");
     await page.waitForFunction(() => /rows?,/.test(document.querySelector("#status").textContent), null, { timeout: 30_000 });
     assert.match(await page.textContent("#status"), /^1 row, 2 nodes highlighted/);
+    await cursorOn("document.cookie", "MemberExpression");
 
     // A graph over the node budget opens collapsed; double-click expands, and a query pulls a collapsed hit into view.
     const BIG = Array.from({ length: 400 }, (_, i) => `function f${i}(a) {\n    return g${i}(a + ${i});\n}\n`).join("") + "function needle(x) {\n    return x;\n}\n";
@@ -113,6 +125,10 @@ try {
     assert.match(await page.textContent("#status"), /^1 row, 1 node highlighted/);
     assert.ok(await page.evaluate(() => cy.nodes(".hit").length) === 1);
     assert.ok(await page.evaluate(() => cy.nodes().length) > expanded);
+    // The cursor reveals a collapsed node too.
+    const hidden = await page.evaluate(() => cy.nodes().length);
+    await cursorOn("x;\n}\n", "Identifier x", 1);
+    assert.ok(await page.evaluate(() => cy.nodes().length) > hidden);
 
     await page.screenshot({ path: "e2e-screenshot.png" });
     const unexpected = errors.filter((e) => !/Nope/.test(e)); // the bad query is logged on purpose
