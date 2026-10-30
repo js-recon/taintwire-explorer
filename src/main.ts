@@ -146,7 +146,8 @@ const cypherEditor = monaco.editor.create($("cypher"), {
     lineNumbers: "off",
 });
 
-let graph: taintwire.TaintGraph | undefined;
+// A graph in this page (WASM), or the one a connected backend holds.
+let graph: Pick<taintwire.TaintGraph, "query" | "close"> | undefined;
 let busy = false;
 let editorFile: string | undefined; // the file whose source is in the JS editor; undefined = the editor's own code
 let uploads = 0;
@@ -158,7 +159,7 @@ const multi = () => $<HTMLSelectElement>("session").value === "multi";
 async function guarded(label: string, fn: () => Promise<string>) {
     if (busy) return;
     busy = true;
-    for (const b of ["session", "generate", "open-db", "open-jsr", "run", "fit"]) $<HTMLButtonElement>(b).disabled = true;
+    for (const b of ["session", "generate", "open-db", "open-jsr", "connect", "run", "fit"]) $<HTMLButtonElement>(b).disabled = true;
     status(label);
     const t = performance.now();
     try {
@@ -168,7 +169,7 @@ async function guarded(label: string, fn: () => Promise<string>) {
         console.error(e);
     } finally {
         busy = false;
-        for (const b of ["session", "generate", "open-db", "open-jsr"]) $<HTMLButtonElement>(b).disabled = false;
+        for (const b of ["session", "generate", "open-db", "open-jsr", "connect"]) $<HTMLButtonElement>(b).disabled = false;
         $<HTMLButtonElement>("run").disabled = $<HTMLButtonElement>("fit").disabled = !graph;
     }
 }
@@ -199,10 +200,10 @@ async function generate() {
     }
     const paths = [...$("files").querySelectorAll<HTMLElement>(".file:has(> input:checked)")].map((f) => f.dataset.path!);
     if (!paths.length) throw new Error("No files checked; open a js-recon.db and check the files to analyze");
-    graph = await taintwire.TaintGraph.open(undefined, { parser });
+    const g = (graph = await taintwire.TaintGraph.open(undefined, { parser }));
     for (const [i, path] of paths.entries()) {
         status(`Parsing ${i + 1}/${paths.length}: ${path}`);
-        await graph.add(files.get(path)!.getValue(), path);
+        await g.add(files.get(path)!.getValue(), path);
         markBuilt(files.get(path)!);
     }
     return `${await render()}, ${paths.length} file${paths.length === 1 ? "" : "s"}`;
@@ -494,10 +495,11 @@ async function runQuery() {
     return `${rows.length} row${rows.length === 1 ? "" : "s"}${rows.length > 1000 ? " (showing 1000)" : ""}, ${hits.length} node${hits.length === 1 ? "" : "s"} highlighted`;
 }
 
-// Clicking a node selects its source in the JS editor; clicking the background clears highlights.
+// Clicking a node selects its source in the JS editor (or the backend's IDE); clicking the background clears highlights.
 cy.on("tap", "node", (e) => {
     const { s, e: end, file } = e.target.data();
     if (s == null) return;
+    if (backend) return void api("/api/reveal", { file, s, e: end }).catch((err) => status(err.message, true));
     if (editorFile !== undefined && file !== editorFile) {
         if (!multi() || !files.has(file)) return;
         openFile(file);
@@ -509,6 +511,91 @@ cy.on("tap", "node", (e) => {
     jsEditor.setSelection(range);
     jsEditor.revealRangeInCenter(range);
 });
+let backend: { base: string; token: string } | undefined;
+const remoteGraph = { query: (cypher: string, params?: Record<string, unknown>) => api("/api/query", { cypher, params }), close: async () => {} };
+
+async function api(path: string, body?: unknown) {
+    const { base, token } = backend!;
+    let res: Response;
+    try {
+        res = await fetch(base + path, {
+            method: body ? "POST" : "GET",
+            headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+            body: body ? JSON.stringify(body) : undefined,
+        });
+    } catch {
+        const mixed = location.protocol === "https:" && base.startsWith("http:");
+        throw new Error(`Can't reach ${base}${mixed ? " (an https page can't call an http backend: serve the backend over https, or run the explorer locally)" : ""}`);
+    }
+    const out = await res.json();
+    if (!res.ok) throw new Error(out.error);
+    return out;
+}
+
+/** Switch to the backend this URL (as the backend printed it, with its ?token=) points at: its IDE replaces the JS editor. */
+async function connect(input: string) {
+    const url = new URL(input);
+    const token = url.searchParams.get("token");
+    if (!token) throw new Error("That URL has no ?token=; copy the whole Connect URL the backend printed");
+    backend = { base: url.origin + url.pathname.replace(/\/$/, ""), token };
+    let info;
+    try {
+        info = await api("/api/info");
+    } catch (e) {
+        backend = undefined;
+        throw e;
+    }
+    await reset();
+    setSession("single");
+    for (const id of ["session", "generate", "open-jsr-label", "editor", "files"]) $(id).hidden = true;
+    for (const el of [$("parser").parentElement!, $("open-db").parentElement!]) el.hidden = true;
+    $("code").dataset.title = "";
+    document.querySelector("main")!.style.setProperty("--left", "1.6fr");
+    $<HTMLIFrameElement>("ide").src = backend.base + info.ide;
+    $("ide").hidden = false;
+    $("connect").textContent = "Disconnect";
+    listen();
+    if (!info.graph) return "Connected — build a graph from the IDE (taintwire button in its status bar, or right-click a folder)";
+    graph = remoteGraph;
+    return `${describe(info.graph)}: ${await render()}`;
+}
+
+const describe = (g: { dir: string; taintwire: string; files: number }) => `${g.dir} (${g.files} files, taintwire ${g.taintwire})`;
+
+/** Follow the backend's events (server-sent, read off a fetch so the token can go in a header); reconnects on drop. */
+async function listen() {
+    for (;;) {
+        try {
+            const { base, token } = backend!;
+            const res = await fetch(`${base}/api/events`, { headers: { authorization: `Bearer ${token}` } });
+            const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader();
+            let buf = "";
+            for (let r; !(r = await reader.read()).done; ) {
+                buf += r.value;
+                for (let i; (i = buf.indexOf("\n\n")) >= 0; buf = buf.slice(i + 2)) if (buf.startsWith("data: ")) onEvent(JSON.parse(buf.slice(6, i)));
+            }
+        } catch (e) {
+            console.error(e);
+        }
+        await new Promise((ok) => setTimeout(ok, 3000));
+    }
+}
+
+function onEvent(ev: { type: string; [k: string]: unknown }) {
+    if (ev.type === "built")
+        guarded("Loading graph…", async () => {
+            await reset();
+            graph = remoteGraph;
+            return `${describe(ev as never)}: ${await render()}`;
+        });
+    else if (ev.type === "query") {
+        cypherEditor.setValue(ev.cypher as string);
+        doRun();
+    } else if (ev.type === "building") status("Building the graph in the backend…");
+    else if (ev.type === "log" && !busy) status(String(ev.msg).split("\n").at(-1)!);
+    else if (ev.type === "failed") status(`Build failed: ${ev.error}`, true);
+}
+
 // Moving the cursor in the JS editor marks the deepest node whose source range contains the selection.
 let cursorSeq = 0;
 jsEditor.onDidChangeCursorSelection(async ({ selection }: { selection: InstanceType<typeof monaco.Selection> }) => {
@@ -585,6 +672,11 @@ $("files").addEventListener("click", (e) => {
     if (el.classList.contains("file")) openFile(el.dataset.path!);
 });
 $("fit").addEventListener("click", () => cy.fit(undefined, 20));
+$("connect").addEventListener("click", () => {
+    if (backend) return location.reload();
+    const url = prompt("Backend URL, as the backend printed it (http://host:8080/?token=…)");
+    if (url) guarded("Connecting…", () => connect(url.trim()));
+});
 jsEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, doGenerate);
 cypherEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, doRun);
 
