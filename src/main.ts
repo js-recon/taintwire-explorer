@@ -673,7 +673,7 @@ $("files").addEventListener("click", (e) => {
 });
 $("fit").addEventListener("click", () => cy.fit(undefined, 20));
 $("connect").addEventListener("click", () => {
-    if (backend) return location.reload();
+    if (backend) return location.assign(location.pathname); // drops a ?token= that would connect again
     const url = prompt("Backend URL, as the backend printed it (http://host:8080/?token=…)");
     if (url) guarded("Connecting…", () => connect(url.trim()));
 });
@@ -682,3 +682,5 @@ cypherEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, doRun);
 
 status("Ready — edit the code and hit Generate");
 $<HTMLButtonElement>("generate").disabled = false;
+// Served by a backend and opened through its Connect URL: connect to it straight away.
+if (new URLSearchParams(location.search).has("token")) guarded("Connecting…", () => connect(location.href));
