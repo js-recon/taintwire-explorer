@@ -6,7 +6,6 @@ Paste JavaScript, build its [taintwire](https://taintwire.js-recon.io) graph in 
 - **Run query** (Ctrl/Cmd+Enter in the Cypher editor) shows the rows under the graph and highlights every node a row mentions. **Example queries** has starters.
 - Click a node to select its source. Toggle relations in the legend.
 - **Multi file** (navbar session dropdown) swaps the editor for a file explorer. **Open js-recon.db…** loads the JS files [js-recon](https://github.com/js-recon/js-recon) downloaded (its `raw_files` table, js-recon 2.1.0-alpha.1 or newer), and Generate builds one graph from the checked files. Clicking a node opens the file it came from. A taintwire DB holding several files also opens as a multi-file session.
-- **Connect backend** uses a self-hosted [taintwire-explorer-backend](https://github.com/js-recon/taintwire-explorer-backend) (paste the URL it prints, or just open that URL: the backend serves this explorer too). An IDE replaces the JS editor. Upload or build an app there, build its graph with native taintwire (any version, branch or commit), and run `.cypher` files from it. Results and the graph show here, and clicking a node selects its source in the IDE.
 
 ## Develop
 
@@ -15,8 +14,6 @@ npm install
 npm run dev        # http://localhost:5173
 npm run build      # dist/
 npm run e2e        # headless Chromium against the built dist/ (npx playwright install chromium-headless-shell once)
-# against a running backend, on the machine whose workspace it serves:
-BACKEND_URL=http://127.0.0.1:8080/?token=… WORKSPACE=/workspace npm run e2e:backend
 ```
 
 ## Deploy (Cloudflare Workers)

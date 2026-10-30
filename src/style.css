@@ -23,8 +23,7 @@ main { display: grid; grid-template-columns: var(--left, 1fr) 5px 1fr; grid-temp
 #cypher { grid-column: 1; grid-row: 2; }
 #code, #cypher { min-height: 0; overflow: hidden; position: relative; }
 #code { display: flex; }
-#editor, #ide { flex: 1; min-width: 0; }
-#ide { border: 0; }
+#editor { flex: 1; min-width: 0; }
 #files { width: 220px; flex: none; overflow: auto; padding: 4px 0; background: var(--panel); border-right: 1px solid var(--border); font: 12px ui-monospace, monospace; white-space: nowrap; }
 #files details > :not(summary) { margin-left: 12px; }
 #files summary, #files .file { padding: 1px 6px; cursor: pointer; }

@@ -7,8 +7,7 @@
         "dev": "vite",
         "build": "tsc --noEmit && vite build",
         "preview": "vite preview",
-        "e2e": "node e2e.mjs",
-        "e2e:backend": "node e2e-backend.mjs"
+        "e2e": "node e2e.mjs"
     },
     "dependencies": {
         "@js-recon/taintwire": "^0.1.1",
