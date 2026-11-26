@@ -8,6 +8,7 @@ import lbug from "@ladybugdb/wasm-core"; // CJS: FS lives on the default export
 // Not in wasm-core's `exports`, so it's imported by path; Vite emits it as an asset and hands back its URL.
 import workerUrl from "../node_modules/@ladybugdb/wasm-core/lbug_wasm_worker.js?url";
 import sqlWasmUrl from "sql.js/dist/sql-wasm-browser.wasm?url";
+import { batches, plan, showCypher, type EdgeRow, type NodeRow, type Step } from "./plan";
 
 // ponytail: wasm-core 0.21.2's worker calls FS.writeFile, but its WASMFS build only exposes createDataFile on FS.
 // Wrap the worker so FS gains writeFile when it's assigned; drop this once upstream exposes it.
@@ -104,6 +105,10 @@ const cy = cytoscape({
         { selector: ".hit", style: { "background-color": "#f44747", width: 18, height: 18, "z-index": 10 } },
         { selector: ".dim", style: { opacity: 0.25 } },
         { selector: "node:selected", style: { "border-width": 3, "border-color": "#ffcc00" } },
+        // Debugger: laid out from the start, shown once their CREATE has run; the last command's elements stand out.
+        { selector: ".pending", style: { visibility: "hidden", events: "no" } },
+        { selector: "node.fresh", style: { "border-width": 3, "border-color": "#ff8c00", width: 16, height: 16 } },
+        { selector: "edge.fresh", style: { width: 4 } },
         { selector: ".cursor", style: { "border-width": 4, "border-color": "#ffcc00", width: 18, height: 18, "z-index": 11, opacity: 1 } },
     ],
 });
@@ -138,7 +143,7 @@ const editorOpts = { theme: "vs-dark", automaticLayout: true, minimap: { enabled
 // Created by hand: a model Monaco makes from `value` is disposed as soon as setModel swaps it out for a multi-file one.
 const singleModel = monaco.editor.createModel(SAMPLE, "javascript");
 type Model = typeof singleModel;
-const jsEditor = monaco.editor.create($("editor"), { ...editorOpts, model: singleModel });
+const jsEditor = monaco.editor.create($("editor"), { ...editorOpts, model: singleModel, glyphMargin: true });
 const cypherEditor = monaco.editor.create($("cypher"), {
     ...editorOpts,
     value: EXAMPLES["Paths from location.* into html"],
@@ -147,18 +152,34 @@ const cypherEditor = monaco.editor.create($("cypher"), {
 });
 
 let graph: taintwire.TaintGraph | undefined;
+let cursorSeq = 0; // bumped per cursor lookup and per reset; a lookup whose number is stale drops its result
 let busy = false;
 let editorFile: string | undefined; // the file whose source is in the JS editor; undefined = the editor's own code
 let uploads = 0;
 const built = new Map<Model, number>(); // each model's version the graph was built from; offsets are stale once it changes
 const files = new Map<string, Model>(); // multi-file session: path -> its editor model
 const multi = () => $<HTMLSelectElement>("session").value === "multi";
+const SINGLE_FILE = "input.js"; // the single-file session's filename in the graph
+/** A debugger session: the plan, the next step to run, and whether a command is running (and was asked to pause). */
+let dbg: { steps: Step[]; at: number; running: boolean; pause: boolean; stop?: boolean; last?: Step } | undefined;
+const breakpoints = new WeakMap<Model, string[]>(); // each model's breakpoint decoration ids; they move with edits
+
+/** Enable each control for the current state: idle, busy (guarded), debugging paused, or debugging running. */
+function syncButtons() {
+    const set = (ids: string[], disabled: boolean) => ids.forEach((b) => ($<HTMLButtonElement>(b).disabled = disabled));
+    set(["session", "generate", "debug", "parser", "open-db", "open-jsr"], busy || !!dbg);
+    set(["run", "fit"], busy || !graph || !!dbg?.running);
+    set(["dbg-continue", "dbg-over", "dbg-into"], busy || !dbg || dbg.running);
+    set(["dbg-pause"], !dbg?.running);
+    set(["dbg-stop"], busy || !dbg);
+    $("debug-bar").hidden = !dbg;
+}
 
 /** Run `fn` with the buttons locked; errors go to the status line. */
 async function guarded(label: string, fn: () => Promise<string>) {
     if (busy) return;
     busy = true;
-    for (const b of ["session", "generate", "open-db", "open-jsr", "run", "fit"]) $<HTMLButtonElement>(b).disabled = true;
+    syncButtons();
     status(label);
     const t = performance.now();
     try {
@@ -168,8 +189,7 @@ async function guarded(label: string, fn: () => Promise<string>) {
         console.error(e);
     } finally {
         busy = false;
-        for (const b of ["session", "generate", "open-db", "open-jsr"]) $<HTMLButtonElement>(b).disabled = false;
-        $<HTMLButtonElement>("run").disabled = $<HTMLButtonElement>("fit").disabled = !graph;
+        syncButtons();
     }
 }
 
@@ -179,6 +199,8 @@ const nodeLabel = (r: Record<string, unknown>) => {
 };
 
 async function reset() {
+    if (dbg) endDebug();
+    cursorSeq++; // a cursor lookup in flight is for the graph being closed
     await graph?.close();
     graph = undefined;
     built.clear();
@@ -188,14 +210,15 @@ async function reset() {
 
 const markBuilt = (model: Model) => built.set(model, model.getAlternativeVersionId());
 
-async function generate() {
+/** Parse the editor's code (single file) or the checked files (multi file) into a fresh graph; returns the files, in build order. */
+async function build(): Promise<string[]> {
     await reset();
     const parser = $<HTMLSelectElement>("parser").value as taintwire.Parser;
     if (!multi()) {
-        graph = await taintwire.import(jsEditor.getValue(), { parser });
+        graph = await taintwire.import(jsEditor.getValue(), { parser, filename: SINGLE_FILE });
         editorFile = undefined;
         markBuilt(singleModel);
-        return render();
+        return [SINGLE_FILE];
     }
     const paths = [...$("files").querySelectorAll<HTMLElement>(".file:has(> input:checked)")].map((f) => f.dataset.path!);
     if (!paths.length) throw new Error("No files checked; open a js-recon.db and check the files to analyze");
@@ -205,7 +228,12 @@ async function generate() {
         await graph.add(files.get(path)!.getValue(), path);
         markBuilt(files.get(path)!);
     }
-    return `${await render()}, ${paths.length} file${paths.length === 1 ? "" : "s"}`;
+    return paths;
+}
+
+async function generate() {
+    const paths = await build();
+    return multi() ? `${await render()}, ${paths.length} file${paths.length === 1 ? "" : "s"}` : render();
 }
 
 /** Show one file of the multi-file session in the JS editor. */
@@ -219,6 +247,7 @@ function openFile(path: string) {
 /** Replace the multi-file session's files with these (sorted by path) and build the explorer tree from their paths. */
 function setFiles(rows: { path: string; code: string; url?: string }[]) {
     jsEditor.setModel(singleModel); // before the old models are disposed under it
+    for (const m of files.values()) breakpoints.delete(m);
     for (const m of files.values()) m.dispose();
     files.clear();
     const root = $("files");
@@ -510,10 +539,9 @@ cy.on("tap", "node", (e) => {
     jsEditor.revealRangeInCenter(range);
 });
 // Moving the cursor in the JS editor marks the deepest node whose source range contains the selection.
-let cursorSeq = 0;
 jsEditor.onDidChangeCursorSelection(async ({ selection }: { selection: InstanceType<typeof monaco.Selection> }) => {
     const model = jsEditor.getModel()!;
-    if (!graph || busy || model.getAlternativeVersionId() !== built.get(model)) return;
+    if (!graph || busy || dbg?.running || model.getAlternativeVersionId() !== built.get(model)) return;
     const seq = ++cursorSeq;
     const s = model.getOffsetAt(selection.getStartPosition());
     const e = model.getOffsetAt(selection.getEndPosition());
@@ -523,8 +551,8 @@ jsEditor.onDidChangeCursorSelection(async ({ selection }: { selection: InstanceT
          AND NOT EXISTS { MATCH (n)-[:SON]->(c) WHERE c.startOffset = n.startOffset AND c.endOffset = n.endOffset }
          RETURN n.id AS id ORDER BY n.endOffset - n.startOffset LIMIT 1`,
         { s, e, ...(editorFile === undefined ? {} : { file: editorFile }) }
-    );
-    if (seq !== cursorSeq) return; // a newer cursor move already ran
+    ).catch((err) => (seq === cursorSeq ? Promise.reject(err) : [])); // the graph was closed under it (reset bumps cursorSeq)
+    if (seq !== cursorSeq) return; // a newer cursor move already ran, or the graph was replaced
     cy.$(".cursor").removeClass("cursor");
     if (!hit) return;
     if (cy.nodes().length < total) await reveal([hit.id as string]);
@@ -541,6 +569,232 @@ cy.on("dbltap", "node[more > 0]", (e) =>
         cy.animate({ center: { eles: e.target }, duration: 300 });
         return shown();
     })
+);
+
+// --- Debugger: build the graph, read its rows back, empty it, and replay the rows one statement per step.
+
+/** Every non-Source node and every edge of the graph, with all columns, read through the schema taintwire made. */
+async function readBack() {
+    const cols = async (t: string) => (await graph!.query(`CALL table_info('${t}') RETURN name`)).map((c) => c.name as string);
+    const nodes: NodeRow[] = [];
+    for (const t of await graph!.query("CALL show_tables() RETURN name, type")) {
+        const table = t.name as string;
+        if (t.type !== "NODE" || table === "Source") continue;
+        const c = await cols(table);
+        for (const row of await graph!.query(`MATCH (n:\`${table}\`) RETURN ${c.map((x) => `n.${x} AS ${x}`).join(", ")}`)) nodes.push({ table, row });
+    }
+    const edges: EdgeRow[] = [];
+    for (const rel of taintwire.RELATIONS) {
+        const c = await cols(rel);
+        const q = `MATCH (a)-[e:${rel}]->(b) RETURN a.id AS s, label(a) AS sl, b.id AS t, label(b) AS tl${c.map((x) => `, e.${x} AS ${x}`).join("")}`;
+        for (const { s, sl, t, tl, ...props } of await graph!.query(q)) edges.push({ rel, s: s as string, sl: sl as string, t: t as string, tl: tl as string, props });
+    }
+    return { nodes, edges };
+}
+
+/** Lay out the finished graph once, every element hidden until its step runs, so the picture grows in place. */
+function layoutPlan(steps: Step[]) {
+    // shortcut: only the first BUDGET nodes (in source order) are drawn; later steps still run, raise BUDGET or page if that bites.
+    const nodeSteps = steps.filter((s) => s.node).slice(0, BUDGET);
+    cy.add(
+        nodeSteps.map(({ node }) => {
+            const { table, row: r } = node!;
+            const base = nodeLabel({ type: table, name: r.name, value: r.value, op: r.operator, kind: r.kind });
+            const data = { id: r.id as string, type: table, kind: table, name: r.name, value: r.value, op: r.operator, file: r.file, s: r.startOffset, e: r.endOffset };
+            return { data: { ...data, base, label: base, kids: 0, more: 0 }, classes: "pending" };
+        })
+    );
+    const drawn = steps.filter((s) => s.edge && cy.getElementById(s.edge.s).nonempty() && cy.getElementById(s.edge.t).nonempty());
+    cy.add(drawn.map(({ creates, edge: e }) => ({ data: { id: creates, source: e!.s, target: e!.t, rel: e!.rel, color: REL_COLOR[e!.rel] }, classes: "pending" })));
+    for (const input of $("legend").querySelectorAll("input")) input.dispatchEvent(new Event("change"));
+    spread(true);
+    cy.fit(undefined, 20);
+    total = cy.nodes().length; // nothing to reveal or expand while debugging
+}
+
+const modelFor = (file: string) => (multi() ? files.get(file) : file === SINGLE_FILE ? singleModel : undefined);
+const lineKey = (s: Step) => `${s.file}\0${s.line}`;
+const breakpointLines = (model: Model) =>
+    (breakpoints.get(model) ?? []).map((id) => model.getDecorationRange(id)?.startLineNumber).filter((l): l is number => l != null);
+
+function toggleBreakpoint(model: Model, line: number) {
+    const ids = breakpoints.get(model) ?? [];
+    const hit = ids.find((id) => model.getDecorationRange(id)?.startLineNumber === line);
+    const added = model.deltaDecorations(hit ? [hit] : [], hit ? [] : [
+        { range: new monaco.Range(line, 1, line, 1), options: { glyphMarginClassName: "breakpoint", glyphMarginHoverMessage: { value: "Breakpoint" }, stickiness: 1 } },
+    ]);
+    breakpoints.set(model, [...ids.filter((id) => id !== hit), ...added]);
+}
+
+let exec: { model: Model; ids: string[] } | undefined; // the execution-point decoration
+function clearExec() {
+    if (exec && !exec.model.isDisposed()) exec.model.deltaDecorations(exec.ids, []);
+    exec = undefined;
+}
+
+/** Show where the debugger stands: the next statement's line in the editor, and the last/next statement in the panel. */
+function showPaused() {
+    const { steps, at, last } = dbg!;
+    const next = steps[at];
+    clearExec();
+    const model = modelFor(next.file);
+    if (model) {
+        if (multi() && editorFile !== next.file) openFile(next.file);
+        const range = new monaco.Range(next.line, 1, next.line, 1);
+        exec = { model, ids: model.deltaDecorations([], [{ range, options: { isWholeLine: true, className: "exec-line", glyphMarginClassName: "exec-glyph" } }]) };
+        jsEditor.revealLineInCenterIfOutsideViewport(next.line);
+    }
+    const panel = $("debug-panel");
+    panel.replaceChildren();
+    const row = (label: string, text: string) => {
+        const div = document.createElement("div");
+        div.innerHTML = "<b></b><code></code>";
+        div.querySelector("b")!.textContent = label;
+        div.querySelector("code")!.textContent = text;
+        panel.append(div);
+    };
+    // Follow the build: bring what the last command created into view when none of it is on screen.
+    const fresh = cy.nodes(".fresh");
+    if (fresh.nonempty()) {
+        const { x1, x2, y1, y2 } = cy.extent();
+        const b = fresh.boundingBox({});
+        if (b.x2 < x1 || b.x1 > x2 || b.y2 < y1 || b.y1 > y2) cy.animate({ center: { eles: fresh }, duration: 200 });
+    }
+    if (last) row("ran", showCypher(last));
+    row("next", showCypher(next));
+    panel.hidden = false;
+    const where = multi() ? `${next.file}:${next.line}` : `line ${next.line}`;
+    status(`Paused before step ${at + 1}/${steps.length}, ${where} — ${cy.nodes().not(".pending").length} nodes, ${cy.edges().not(".pending").length} edges so far`);
+}
+
+/** Leave debug mode: no execution point, editor writable again, buttons back. Drops the drawn-but-never-created elements. */
+function endDebug() {
+    clearExec();
+    cy.$(".pending").remove();
+    cy.$(".fresh").removeClass("fresh");
+    $("debug-panel").hidden = true;
+    jsEditor.updateOptions({ readOnly: false });
+    dbg = undefined;
+    syncButtons();
+}
+
+async function startDebug() {
+    const fileOrder = await build();
+    const { nodes, edges } = await readBack();
+    // The schema taintwire created stays; only the rows go, to come back one statement at a time.
+    await graph!.query("MATCH (n) WHERE label(n) <> 'Source' DETACH DELETE n");
+    const steps = plan(nodes, edges, fileOrder);
+    if (!steps.length) throw new Error("Nothing to debug: the graph is empty");
+    layoutPlan(steps);
+    dbg = { steps, at: 0, running: false, pause: false };
+    jsEditor.updateOptions({ readOnly: true }); // offsets in the plan are only valid for this exact text
+    showPaused();
+    return $("status").textContent!;
+}
+
+/** Where a run that starts at `at` stops: one statement (`into`), the end of the line (`over`), or before a breakpoint line (`continue`). */
+function runEnd(mode: "into" | "over" | "continue", at: number, steps: Step[]) {
+    if (mode === "into") return at + 1;
+    const stops = new Set<string>();
+    if (mode === "continue")
+        for (const [file, model] of multi() ? files : [[SINGLE_FILE, singleModel] as const]) for (const l of breakpointLines(model)) stops.add(`${file}\0${l}`);
+    const start = lineKey(steps[at]);
+    let i = at + 1;
+    for (; i < steps.length; i++) {
+        const k = lineKey(steps[i]);
+        if (mode === "over" ? k !== start : k !== lineKey(steps[i - 1]) && stops.has(k)) break;
+    }
+    return i;
+}
+
+const CHUNK = 2000; // statements per pausable chunk of a long run
+
+/** Run debugger steps: `into` one statement, `over` the rest of the current line, `continue` until a breakpoint line or the end. */
+async function debugRun(mode: "into" | "over" | "continue") {
+    if (!dbg || dbg.running || busy) return;
+    const d = dbg;
+    d.running = true;
+    d.pause = false;
+    syncButtons();
+    cy.$(".fresh").removeClass("fresh");
+    const end = runEnd(mode, d.at, d.steps);
+    try {
+        while (d.at < end && !d.pause) {
+            const chunk = d.steps.slice(d.at, Math.min(end, d.at + CHUNK));
+            // One statement runs as itself; longer runs go in batches (same writes, far fewer round trips into the WASM worker).
+            if (chunk.length === 1) await graph!.query(chunk[0].cypher, chunk[0].params);
+            else for (const b of batches(chunk)) await graph!.query(b.cypher, { rows: b.rows });
+            d.at += chunk.length;
+            d.last = chunk.at(-1);
+            cy.batch(() => chunk.forEach((s) => cy.getElementById(s.creates).removeClass("pending").addClass("fresh")));
+            if (d.at < end) status(`Running… ${d.at}/${d.steps.length} statements (Pause to stop here)`);
+        }
+    } catch (e) {
+        status(`Statements ${d.at + 1}… failed: ${(e as Error).message ?? e}`, true);
+        console.error(e);
+        d.running = false;
+        endDebug();
+        return;
+    }
+    d.running = false;
+    if (d.stop) return stopDebug(); // asked while a statement was in flight
+    if (d.at < d.steps.length) {
+        syncButtons();
+        return showPaused();
+    }
+    endDebug();
+    const drawnAll = cy.nodes().length === d.steps.filter((s) => s.node).length;
+    if (!drawnAll) {
+        // Bigger than the debug drawing: show it the way Generate does (top of the AST, expandable).
+        cy.elements().remove();
+        await render();
+    }
+    status(`Debug finished after ${d.steps.length} statements: ${shown()}`);
+}
+
+function stopDebug() {
+    if (!dbg) return;
+    const { at, steps, running } = dbg;
+    if (running) return void (dbg.stop = dbg.pause = true); // debugRun calls back once the running statement is done
+    endDebug();
+    total = cy.nodes().length;
+    status(`Stopped after ${at}/${steps.length} statements; the graph holds only what ran (${shown()})`);
+}
+
+async function debugStart() {
+    await guarded("Preparing debugger…", startDebug);
+    if (!dbg) return;
+    syncButtons();
+    // With breakpoints set, run to the first one; otherwise stay paused before the first statement.
+    if ((multi() ? [...files.values()] : [singleModel]).some((m) => breakpointLines(m).length)) await debugRun("continue");
+}
+
+$("debug").addEventListener("click", debugStart);
+$("dbg-continue").addEventListener("click", () => debugRun("continue"));
+$("dbg-over").addEventListener("click", () => debugRun("over"));
+$("dbg-into").addEventListener("click", () => debugRun("into"));
+$("dbg-pause").addEventListener("click", () => dbg && (dbg.pause = true));
+$("dbg-stop").addEventListener("click", stopDebug);
+jsEditor.onMouseDown((e: { target: { type: number; position: { lineNumber: number } | null } }) => {
+    if (e.target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN && e.target.position) toggleBreakpoint(jsEditor.getModel()!, e.target.position.lineNumber);
+});
+// Debugger keys, as in VS Code; capture phase so they work with focus in an editor too.
+window.addEventListener(
+    "keydown",
+    (e) => {
+        const act: Record<string, () => unknown> = {
+            F5: () => (e.shiftKey ? stopDebug() : dbg ? debugRun("continue") : !busy && debugStart()),
+            F6: () => dbg && (dbg.pause = true),
+            F9: () => toggleBreakpoint(jsEditor.getModel()!, jsEditor.getPosition()!.lineNumber),
+            F10: () => debugRun("over"),
+            F11: () => debugRun("into"),
+        };
+        if (!act[e.key] || e.ctrlKey || e.metaKey || e.altKey) return;
+        e.preventDefault();
+        e.stopPropagation();
+        act[e.key]();
+    },
+    true
 );
 
 for (const name of Object.keys(EXAMPLES)) $("examples").append(new Option(name, name));
@@ -589,4 +843,4 @@ jsEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, doGenerate);
 cypherEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, doRun);
 
 status("Ready — edit the code and hit Generate");
-$<HTMLButtonElement>("generate").disabled = false;
+syncButtons();

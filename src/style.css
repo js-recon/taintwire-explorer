@@ -46,4 +46,15 @@ main { display: grid; grid-template-columns: var(--left, 1fr) 5px 1fr; grid-temp
     main { grid-template-columns: 1fr; grid-template-rows: 40vh 15vh 60vh; overflow: auto; }
     #divider { display: none; }
     #graph-pane { grid-column: 1; grid-row: 3; }
+    #debug-panel { max-width: none; top: auto; left: 8px; right: 8px; bottom: 8px; max-height: 35%; overflow: auto; z-index: 6; }
 }
+#debug-bar { display: contents; }
+#debug-bar[hidden] { display: none; }
+#dbg-stop { background: #a1260d; }
+#debug-panel { position: absolute; top: 8px; left: 8px; max-width: calc(100% - 240px); background: #252526e6; border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font: 12px ui-monospace, monospace; display: grid; gap: 4px; }
+#debug-panel div { display: flex; gap: 8px; }
+#debug-panel b { color: var(--muted); font-weight: normal; flex: none; width: 3em; }
+#debug-panel code { overflow-wrap: anywhere; }
+.breakpoint { background: #e51400; border-radius: 50%; width: 10px !important; height: 10px !important; margin: 4px 0 0 5px; }
+.exec-line { background: #ffcc0026; }
+.exec-glyph::after { content: "▶"; color: #ffcc00; font-size: 11px; position: absolute; left: 4px; }

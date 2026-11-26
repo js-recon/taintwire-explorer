@@ -15,6 +15,14 @@
                 <option value="multi">Multi file</option>
             </select>
             <button id="generate" title="Ctrl/Cmd+Enter in the JS editor" disabled>Generate</button>
+            <button id="debug" title="Build the graph one statement at a time (F5). Click the editor's left gutter or press F9 to set a breakpoint" disabled>Debug</button>
+            <span id="debug-bar" hidden>
+                <button id="dbg-continue" title="Continue to the next breakpoint line or the end (F5)">Continue</button>
+                <button id="dbg-over" title="Step over: run every statement of this line (F10)">Step over</button>
+                <button id="dbg-into" title="Step into: run one statement (F11)">Step into</button>
+                <button id="dbg-pause" title="Pause (F6)">Pause</button>
+                <button id="dbg-stop" title="Stop debugging (Shift+F5)">Stop</button>
+            </span>
             <label>parser
                 <select id="parser">
                     <option value="cs-mast">cs-mast</option>
@@ -39,6 +47,7 @@
             <section id="graph-pane">
                 <div id="graph"></div>
                 <div id="legend"></div>
+                <div id="debug-panel" hidden></div>
                 <div id="results" hidden></div>
             </section>
         </main>

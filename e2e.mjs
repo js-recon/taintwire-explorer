@@ -33,6 +33,7 @@ await multiGraph.close();
 
 const PORT = 4179;
 const server = spawn(process.execPath, ["node_modules/vite/bin/vite.js", "preview", "--port", String(PORT), "--strictPort"], { stdio: "pipe" });
+process.on("exit", () => server.kill()); // also when the browser fails to launch, before the try below
 await new Promise((ok, fail) => {
     server.stdout.on("data", (d) => String(d).includes(String(PORT)) && ok());
     server.on("exit", fail);
@@ -62,6 +63,93 @@ try {
 
     // The Monaco loader puts `monaco` on window; editors are [JS, Cypher] in creation order.
     const setEditor = (i, value) => page.evaluate(([i, v]) => window.monaco.editor.getEditors()[i].setValue(v), [i, value]);
+    const statusIs = (re) =>
+        page.waitForFunction((src) => new RegExp(src).test(document.querySelector("#status").textContent) || document.querySelector("#status").classList.contains("error"), re.source, { timeout: 60_000 })
+            .then(async () => assert.match(await page.textContent("#status"), re));
+
+    // Debugger: breakpoints from the gutter, step into/over, continue, stop; the finished graph equals Generate's.
+    const DEBUG_CODE = "function id(x) {\n    return x;\n}\nconst a = source();\nsink(id(a));\n";
+    const counts = async () => {
+        const out = [];
+        for (const q of ["MATCH (n) RETURN label(n) AS t, count(*) AS c ORDER BY t", "MATCH ()-[e]->() RETURN label(e) AS t, count(*) AS c ORDER BY t"]) {
+            await setEditor(1, q);
+            await page.click("#run");
+            await statusIs(/^\d+ rows?,/);
+            out.push(await page.$$eval("#results tbody tr", (trs) => trs.map((t) => t.textContent)));
+        }
+        return out;
+    };
+    const clickGutter = async (line) => {
+        const pt = await page.evaluate((line) => {
+            const ed = window.monaco.editor.getEditors()[0], r = ed.getDomNode().getBoundingClientRect(), li = ed.getLayoutInfo();
+            return { x: r.left + li.glyphMarginLeft + li.glyphMarginWidth / 2, y: r.top + ed.getTopForLineNumber(line) - ed.getScrollTop() + 8 };
+        }, line);
+        await page.mouse.click(pt.x, pt.y);
+    };
+    // Click (or press) and wait for the status to change to `re`: paused statuses already match before the step runs.
+    const stepWith = async (act, re) => {
+        const was = await page.textContent("#status");
+        await act();
+        await page.waitForFunction((w) => document.querySelector("#status").textContent !== w, was, { timeout: 60_000 });
+        await statusIs(re);
+    };
+    const visible = () => page.evaluate(() => cy.elements().not(".pending").length); // created so far (legend-hidden edges count)
+    const pausedLine = async () => Number((await page.textContent("#status")).match(/^Paused before step \d+\/\d+, line (\d+)/)?.[1]);
+    const readOnly = () => page.evaluate(() => window.monaco.editor.getEditors()[0].getOption(window.monaco.editor.EditorOption.readOnly));
+    await setEditor(0, DEBUG_CODE);
+    await page.click("#generate");
+    await statusIs(/nodes, \d+ edges/);
+    const generated = await counts();
+    const generatedEls = await page.evaluate(() => cy.elements().length);
+    await clickGutter(4);
+    await page.waitForFunction(([sel, n]) => document.querySelectorAll(sel).length === n, ["#editor .breakpoint", 1]); // Monaco renders decorations a frame later
+    await page.click("#debug");
+    await statusIs(/^Paused before step \d+\/\d+, line 4/); // ran to the breakpoint
+    await page.waitForFunction(([sel, n]) => document.querySelectorAll(sel).length === n, ["#editor .exec-line", 1]); // Monaco renders decorations a frame later
+    assert.equal(await readOnly(), true);
+    assert.equal(await page.isDisabled("#generate"), true);
+    assert.match(await page.textContent("#debug-panel"), /next\s*CREATE \(:`VariableDeclaration`/);
+    const v0 = await visible();
+    assert.ok(v0 > 0 && v0 < generatedEls, `partial graph: ${v0}`);
+    await stepWith(() => page.click("#dbg-into"), /^Paused before step/);
+    assert.equal(await visible(), v0 + 1, "step into adds one element");
+    assert.equal(await page.evaluate(() => cy.$(".fresh").length), 1);
+    await stepWith(() => page.click("#dbg-over"), /^Paused before step/);
+    assert.equal(await pausedLine(), 5, "step over moves to the next line");
+    // Queries see the partial graph while paused, and it matches what's drawn.
+    await setEditor(1, "MATCH (n) WHERE label(n) <> 'Source' RETURN count(*) AS n");
+    await page.click("#run");
+    await statusIs(/^1 row,/);
+    assert.equal(Number(await page.textContent("#results tbody td")), await page.evaluate(() => cy.nodes().not(".pending").length));
+    assert.equal(await page.isDisabled("#dbg-continue"), false);
+    await page.click("#dbg-continue");
+    await statusIs(/^Debug finished after \d+ statements: \d+ nodes, \d+ edges/);
+    assert.equal(await page.evaluate(() => cy.elements().length), generatedEls);
+    assert.equal(await page.evaluate(() => cy.$(".pending").length), 0);
+    assert.equal(await readOnly(), false);
+    assert.deepEqual(await counts(), generated, "debugged graph equals generated graph");
+    // Keyboard: F5 starts (to the breakpoint), F11 steps, Shift+F5 stops with the partial graph kept; Generate works after.
+    await page.click("#editor .view-lines");
+    await page.keyboard.press("F5");
+    await statusIs(/^Paused before step \d+\/\d+, line 4/);
+    const v1 = await visible();
+    await stepWith(() => page.keyboard.press("F11"), /^Paused before step/);
+    assert.equal(await visible(), v1 + 1);
+    await page.keyboard.press("Shift+F5");
+    await statusIs(/^Stopped after \d+\/\d+ statements/);
+    assert.equal(await page.evaluate(() => cy.elements().length), v1 + 1, "stop drops what never ran");
+    assert.equal(await page.isHidden("#debug-bar"), true);
+    await page.waitForFunction(([sel, n]) => document.querySelectorAll(sel).length === n, ["#editor .exec-line", 0]); // Monaco renders decorations a frame later
+    await clickGutter(4); // clears the breakpoint
+    await page.waitForFunction(([sel, n]) => document.querySelectorAll(sel).length === n, ["#editor .breakpoint", 0]); // Monaco renders decorations a frame later
+    // No breakpoints: Debug stops before the first statement.
+    await page.click("#debug");
+    await statusIs(/^Paused before step 1\/\d+, line 1/);
+    await page.click("#dbg-stop");
+    await statusIs(/^Stopped after 0\//);
+    await page.click("#generate");
+    await statusIs(/nodes, \d+ edges/);
+    assert.deepEqual(await counts(), generated);
     await setEditor(0, "function id(x) {\n    return x;\n}\nconst a = source();\nsink(id(a));\n");
     await page.click("#generate");
     await page.waitForFunction(() => /nodes, \d+ edges/.test(document.querySelector("#status").textContent), null, { timeout: 60_000 });
@@ -163,10 +251,21 @@ try {
     await cursorOn("x;\n}\n", "Identifier x", 1);
     assert.ok(await page.evaluate(() => cy.nodes().length) > hidden);
 
+    // Debugging a graph over the budget: Pause stops a long Continue part-way; the end shows it collapsed, as Generate does.
+    const generatedBig = await counts();
+    await page.click("#debug");
+    await statusIs(/^Paused before step 1\/\d+/);
+    await page.click("#dbg-continue");
+    await page.waitForFunction(() => /^Running…/.test(document.querySelector("#status").textContent), null, { timeout: 60_000 });
+    await page.click("#dbg-pause");
+    await statusIs(/^Paused before step \d+\/\d+/);
+    const [k, n] = (await page.textContent("#status")).match(/step (\d+)\/(\d+)/).slice(1).map(Number);
+    assert.ok(k > 1 && k < n, `paused part-way: ${k}/${n}`);
+    await page.click("#dbg-continue");
+    await statusIs(/^Debug finished after \d+ statements: \d+ nodes, \d+ edges \(of \d+ nodes/);
+    assert.deepEqual(await counts(), generatedBig);
+
     // Multi-file session: js-recon.db's raw_files become a file tree, and Generate parses only the checked files.
-    const statusIs = (re) =>
-        page.waitForFunction((src) => new RegExp(src).test(document.querySelector("#status").textContent) || document.querySelector("#status").classList.contains("error"), re.source, { timeout: 60_000 })
-            .then(async () => assert.match(await page.textContent("#status"), re));
     const graphFiles = () => page.evaluate(() => [...new Set(cy.nodes().map((n) => n.data("file")).filter(Boolean))].sort());
     const editorText = () => page.evaluate(() => window.monaco.editor.getEditors()[0].getValue());
     await page.selectOption("#session", "multi");
@@ -192,6 +291,19 @@ try {
     assert.equal(await editorText(), RAW["output/app/lib/sink.js"]);
     await cursorOn("eval(v)", "CallExpression");
     assert.equal(await page.evaluate(() => cy.nodes(".cursor").data("file")), "output/app/lib/sink.js");
+    // Debugging a multi-file session walks the files in order, opening each, and ends with the same graph.
+    const multiCounts = await counts();
+    await page.click("#debug");
+    await statusIs(/^Paused before step 1\/\d+, output\/app\/lib\/sink\.js:1/);
+    await page.click("#files .file[data-path='output/app/main.js']");
+    await clickGutter(2);
+    await stepWith(() => page.click("#dbg-continue"), /^Paused before step \d+\/\d+, output\/app\/main\.js:2/);
+    assert.equal(await editorText(), RAW["output/app/main.js"]);
+    await page.click("#dbg-continue");
+    await statusIs(/^Debug finished/);
+    assert.deepEqual(await counts(), multiCounts);
+    assert.deepEqual(await graphFiles(), paths);
+    await clickGutter(2);
     // A taintwire DB with several files opens as a multi-file session, and switching back to single file hides the tree.
     await page.selectOption("#session", "single");
     await statusIs(/^Ready/);
