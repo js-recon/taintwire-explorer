@@ -79,6 +79,23 @@ try {
         }
         return out;
     };
+    // Every column of every node and edge, as sorted table rows: the replay must restore values, not just counts.
+    const dump = async () => {
+        const out = [];
+        for (const q of [
+            "MATCH (n) WHERE label(n) <> 'Source' RETURN n.id, n.type, n.file, n.line, n.col, n.endLine, n.endCol, n.startOffset, n.endOffset, n.name, n.value, n.operator, n.props, n.hash, n.kind, n.signature, n.owner_signature",
+            "MATCH (a)-[e]->(b) RETURN a.id, label(e), b.id, e.key, e.idx, e.access, e.access_signature, e.candidates, e.arg_index, e.callsite",
+        ]) {
+            await setEditor(1, q);
+            await page.click("#run");
+            await statusIs(/^\d+ rows?,/);
+            out.push((await page.$$eval("#results tbody tr", (trs) => trs.map((t) => [...t.cells].map((c) => c.textContent).join("|")))).sort());
+        }
+        assert.ok(out[0].length > 15 && out[1].length > 15, "dump has rows");
+        // AST node ids are random per build, so name each node by its type and source span instead.
+        const canon = new Map(out[0].map((r) => { const c = r.split("|"); return [c[0], `${c[1]}@${c[7]}-${c[8]}`]; }));
+        return out.map((rows) => rows.map((r) => r.replace(/\b[A-Z]\w*_[0-9a-f]{16}\b/g, (id) => canon.get(id) ?? id)).sort());
+    };
     const clickGutter = async (line) => {
         const pt = await page.evaluate((line) => {
             const ed = window.monaco.editor.getEditors()[0], r = ed.getDomNode().getBoundingClientRect(), li = ed.getLayoutInfo();
@@ -100,6 +117,7 @@ try {
     await page.click("#generate");
     await statusIs(/nodes, \d+ edges/);
     const generated = await counts();
+    const generatedDump = await dump();
     const generatedEls = await page.evaluate(() => cy.elements().length);
     await clickGutter(4);
     await page.waitForFunction(([sel, n]) => document.querySelectorAll(sel).length === n, ["#editor .breakpoint", 1]); // Monaco renders decorations a frame later
@@ -128,6 +146,7 @@ try {
     assert.equal(await page.evaluate(() => cy.$(".pending").length), 0);
     assert.equal(await readOnly(), false);
     assert.deepEqual(await counts(), generated, "debugged graph equals generated graph");
+    assert.deepEqual(await dump(), generatedDump, "debugged graph has the generated graph's values");
     // Keyboard: F5 starts (to the breakpoint), F11 steps, Shift+F5 stops with the partial graph kept; Generate works after.
     await page.click("#editor .view-lines");
     await page.keyboard.press("F5");
@@ -140,7 +159,14 @@ try {
     assert.equal(await page.evaluate(() => cy.elements().length), v1 + 1, "stop drops what never ran");
     assert.equal(await page.isHidden("#debug-bar"), true);
     await page.waitForFunction(([sel, n]) => document.querySelectorAll(sel).length === n, ["#editor .exec-line", 0]); // Monaco renders decorations a frame later
+    // A breakpoint on line 1 stops before the first statement (File/Program are line 1).
     await clickGutter(4); // clears the breakpoint
+    await clickGutter(1);
+    await page.click("#debug");
+    await statusIs(/^Paused before step 1\/\d+, line 1/);
+    await page.click("#dbg-stop");
+    await statusIs(/^Stopped after 0\//);
+    await clickGutter(1);
     await page.waitForFunction(([sel, n]) => document.querySelectorAll(sel).length === n, ["#editor .breakpoint", 0]); // Monaco renders decorations a frame later
     // No breakpoints: Debug stops before the first statement.
     await page.click("#debug");

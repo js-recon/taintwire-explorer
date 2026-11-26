@@ -765,8 +765,10 @@ async function debugStart() {
     await guarded("Preparing debugger…", startDebug);
     if (!dbg) return;
     syncButtons();
-    // With breakpoints set, run to the first one; otherwise stay paused before the first statement.
-    if ((multi() ? [...files.values()] : [singleModel]).some((m) => breakpointLines(m).length)) await debugRun("continue");
+    // With breakpoints set, run to the first one (unless it's the first line); otherwise stay paused before the first statement.
+    const first = dbg.steps[0];
+    const onFirst = breakpointLines(modelFor(first.file) ?? singleModel).includes(first.line) && !!modelFor(first.file);
+    if (!onFirst && (multi() ? [...files.values()] : [singleModel]).some((m) => breakpointLines(m).length)) await debugRun("continue");
 }
 
 $("debug").addEventListener("click", debugStart);
@@ -782,14 +784,13 @@ jsEditor.onMouseDown((e: { target: { type: number; position: { lineNumber: numbe
 window.addEventListener(
     "keydown",
     (e) => {
+        // Outside a session only F5 (start) and F9 (breakpoint) are taken, so F11 fullscreen etc. still work.
         const act: Record<string, () => unknown> = {
-            F5: () => (e.shiftKey ? stopDebug() : dbg ? debugRun("continue") : !busy && debugStart()),
-            F6: () => dbg && (dbg.pause = true),
-            F9: () => toggleBreakpoint(jsEditor.getModel()!, jsEditor.getPosition()!.lineNumber),
-            F10: () => debugRun("over"),
-            F11: () => debugRun("into"),
+            F5: () => (e.shiftKey ? !busy && stopDebug() : dbg ? debugRun("continue") : !busy && debugStart()),
+            F9: () => jsEditor.getPosition() && toggleBreakpoint(jsEditor.getModel()!, jsEditor.getPosition()!.lineNumber),
+            ...(dbg && { F6: () => dbg && (dbg.pause = true), F10: () => debugRun("over"), F11: () => debugRun("into") }),
         };
-        if (!act[e.key] || e.ctrlKey || e.metaKey || e.altKey) return;
+        if (!act[e.key] || e.ctrlKey || e.metaKey || e.altKey || (e.key === "F5" && e.shiftKey && !dbg)) return;
         e.preventDefault();
         e.stopPropagation();
         act[e.key]();
